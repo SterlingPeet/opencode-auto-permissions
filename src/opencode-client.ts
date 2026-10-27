@@ -11,6 +11,27 @@ const REVIEWER_PERMISSIONS = [
 const REVIEWER_DIRECTORY = join(tmpdir(), "opencode-auto-permissions", "reviewer")
 const REVIEWER_SESSION_TITLE = "Auto Permissions review"
 
+// Local models wrap the decision in fences, prose, or a stray closing tag, so
+// accept the text from the first "{" to the last "}". A permission gate must
+// fail closed: a reply holding more than one object (an echoed payload, a
+// draft verdict, think text) is rejected rather than letting an earlier object
+// win, because that slice is not valid JSON.
+export function parseReviewerJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch (strictError) {
+    const start = text.indexOf("{")
+    const end = text.lastIndexOf("}")
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1))
+      } catch {}
+    }
+    // Rethrow the strict error so model_failure records the original SyntaxError.
+    throw strictError
+  }
+}
+
 export class OpenCodeClientAdapter implements ReviewerClient {
   constructor(private readonly client: any) {}
 
@@ -117,7 +138,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
           ? { path: { id: sessionID }, query: location, body: fallbackBody }
           : { sessionID, ...location, ...fallbackBody }
         const result = unwrapData(await session.prompt(fallbackInput, { signal: input.signal }))
-        return JSON.parse(assistantText(result))
+        return parseReviewerJson(assistantText(result))
       }
     } finally {
       input.signal.removeEventListener("abort", abortRemote)
@@ -199,7 +220,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       const strictPrompt = `${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
       const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal })
       if (!isRecord(result) || typeof result.text !== "string") throw new Error("OpenCode reviewer returned no text output")
-      return JSON.parse(result.text)
+      return parseReviewerJson(result.text)
     } finally {
       input.signal.removeEventListener("abort", abortRemote)
       if (sessionID) await Promise.resolve(this.client.session.remove({ sessionID })).catch(() => undefined)
