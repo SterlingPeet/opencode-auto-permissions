@@ -1,4 +1,5 @@
 import type { ReviewModel, ReviewerClient } from "./types.ts"
+import { writeDiagnostic } from "./diagnostics.ts"
 import { DECISION_SCHEMA, REVIEWER_AGENT_ID } from "./agent.ts"
 import { mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -33,7 +34,10 @@ export function parseReviewerJson(text: string): unknown {
 }
 
 export class OpenCodeClientAdapter implements ReviewerClient {
-  constructor(private readonly client: any) {}
+  constructor(
+    private readonly client: any,
+    private readonly options: { diagnosticsPath?: string | undefined } = {},
+  ) {}
 
   async prewarm(): Promise<void> {
     await mkdir(REVIEWER_DIRECTORY, { recursive: true })
@@ -223,6 +227,13 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       try {
         return parseReviewerJson(result.text)
       } catch {}
+      writeDiagnostic(this.options.diagnosticsPath, {
+        timestamp: new Date().toISOString(),
+        event: "reviewer_reask",
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        textLength: result.text.length,
+      })
       // generate() has no structured-output option and does not mutate the
       // session, so the model never sees its first reply: this is an
       // independent retry with a stricter instruction, not a follow-up.

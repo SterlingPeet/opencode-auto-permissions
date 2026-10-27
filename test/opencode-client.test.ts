@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { OpenCodeClientAdapter, parseReviewerJson } from "../src/opencode-client.ts"
+import { mkdtemp, readFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 describe("OpenCodeClientAdapter", () => {
   test("uses the current V2 session and permission APIs", async () => {
@@ -575,5 +578,46 @@ describe("OpenCodeClientAdapter V2 generate re-ask", () => {
       signal: new AbortController().signal,
     })).rejects.toBeInstanceOf(SyntaxError)
     expect(prompts).toHaveLength(2)
+  })
+
+  async function diagnosticLines(path: string): Promise<any[]> {
+    // writeDiagnostic is fire-and-forget, so give its queued append a moment to land.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const text = await readFile(path, "utf8").catch(() => "")
+    return text.split("\n").filter(Boolean).map((line) => JSON.parse(line))
+  }
+
+  function adapterWithDiagnostics(replies: string[], diagnosticsPath: string) {
+    const prompts: string[] = []
+    const base = adapterWith(replies, prompts)
+    return new OpenCodeClientAdapter((base as any).client, { diagnosticsPath })
+  }
+
+  test("writes one reviewer_reask diagnostic when the first reply is prose", async () => {
+    const path = join(await mkdtemp(join(tmpdir(), "reask-")), "decisions.jsonl")
+    const prose = "Sure, I would deny that. ".repeat(20)
+    const adapter = adapterWithDiagnostics([prose, decision], path)
+
+    await adapter.generate({ prompt: "review", model, parentSessionID: "ses_parent", signal: new AbortController().signal })
+
+    const lines = await diagnosticLines(path)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({
+      event: "reviewer_reask",
+      providerID: "example",
+      modelID: "local",
+      textLength: prose.length,
+    })
+    // The reply text can hold commands and paths, so only its length is logged.
+    expect(lines[0]).not.toHaveProperty("sample")
+  })
+
+  test("writes no diagnostic when the first reply parses", async () => {
+    const path = join(await mkdtemp(join(tmpdir(), "reask-")), "decisions.jsonl")
+    const adapter = adapterWithDiagnostics([decision], path)
+
+    await adapter.generate({ prompt: "review", model, parentSessionID: "ses_parent", signal: new AbortController().signal })
+
+    expect(await diagnosticLines(path)).toHaveLength(0)
   })
 })
