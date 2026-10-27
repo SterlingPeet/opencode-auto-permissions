@@ -4,6 +4,13 @@ import { defaultDiagnosticsPath } from "./diagnostics.ts"
 const DEFAULT_TIMEOUT_MS = 30_000
 const DEFAULT_USER_MESSAGE_COUNT = 8
 
+export interface StructuredEndpoint {
+  providerID: string
+  baseURL: string
+  apiKey?: string
+  apiKeyEnv?: string
+}
+
 export interface Config {
   model: ReviewModel | undefined
   modelLabel: string | undefined
@@ -14,6 +21,7 @@ export interface Config {
   sessionApprovals: boolean
   runtime: "auto" | "stable" | "v2"
   diagnosticsPath: string | undefined
+  structuredEndpoint: StructuredEndpoint | undefined
 }
 
 export function parseConfig(options: Readonly<Record<string, unknown>>): Config {
@@ -37,6 +45,7 @@ export function parseConfig(options: Readonly<Record<string, unknown>>): Config 
     sessionApprovals: options.sessionApprovals !== false,
     runtime: parseRuntime(options.runtime),
     diagnosticsPath: parseDiagnosticsPath(options.debug),
+    structuredEndpoint: parseStructuredEndpoint(options.structuredEndpoint),
   }
 }
 
@@ -66,6 +75,36 @@ function parseDiagnosticsPath(value: unknown): string | undefined {
   if (value === true) return defaultDiagnosticsPath()
   if (typeof value === "string" && value.trim()) return value.trim()
   throw new Error('Auto Permissions debug must be true, false, or a file path')
+}
+
+function parseStructuredEndpoint(value: unknown): StructuredEndpoint | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Auto Permissions structuredEndpoint must be an object")
+  }
+  const record = value as Record<string, unknown>
+  const providerID = requiredString(record.providerID, "structuredEndpoint.providerID")
+  const baseURL = requiredString(record.baseURL, "structuredEndpoint.baseURL")
+  const apiKey = optionalString(record.apiKey, "structuredEndpoint.apiKey")
+  const apiKeyEnv = optionalString(record.apiKeyEnv, "structuredEndpoint.apiKeyEnv")
+  if (apiKey !== undefined && apiKeyEnv !== undefined) {
+    throw new Error("Auto Permissions structuredEndpoint accepts at most one of apiKey and apiKeyEnv")
+  }
+  return {
+    providerID,
+    baseURL,
+    ...(apiKey !== undefined ? { apiKey } : {}),
+    ...(apiKeyEnv !== undefined ? { apiKeyEnv } : {}),
+  }
+}
+
+function requiredString(value: unknown, name: string): string {
+  if (typeof value === "string" && value.trim()) return value.trim()
+  throw new Error(`Auto Permissions ${name} must be a non-empty string`)
+}
+
+function optionalString(value: unknown, name: string): string | undefined {
+  return value === undefined ? undefined : requiredString(value, name)
 }
 
 function parseRuntime(value: unknown): Config["runtime"] {

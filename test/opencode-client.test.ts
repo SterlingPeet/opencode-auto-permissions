@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { DECISION_SCHEMA, REVIEWER_SYSTEM_PROMPT } from "../src/agent.ts"
 import { OpenCodeClientAdapter, parseReviewerJson } from "../src/opencode-client.ts"
 import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -619,5 +620,150 @@ describe("OpenCodeClientAdapter V2 generate re-ask", () => {
     await adapter.generate({ prompt: "review", model, parentSessionID: "ses_parent", signal: new AbortController().signal })
 
     expect(await diagnosticLines(path)).toHaveLength(0)
+  })
+})
+
+describe("OpenCodeClientAdapter structured endpoint", () => {
+  const endpoint = { providerID: "router", baseURL: "http://localhost:8080/v1/", apiKey: "local" }
+  const model = { providerID: "router", id: "reviewer-model", variant: "low" }
+  const content = '{"decision":"allow","reasonCode":"safe","reason":"Safe operation."}'
+
+  function sdkClient(created: string[]) {
+    return {
+      permission: { request: { list: async () => ({ data: [] }) } },
+      session: {
+        create: async () => {
+          created.push("create")
+          return { id: "ses_review" }
+        },
+        generate: async () => ({ text: content }),
+        remove: async () => {},
+        interrupt: async () => {},
+      },
+    }
+  }
+
+  function input(signal = new AbortController().signal, overrides: object = {}) {
+    return { prompt: "review this", model, parentSessionID: "ses_parent", signal, ...overrides }
+  }
+
+  function jsonResponse(body: unknown, status = 200) {
+    return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+  }
+
+  test("posts the review straight to the endpoint without creating a session", async () => {
+    const created: string[] = []
+    const requests: Array<{ url: string; init: any }> = []
+    const adapter = new OpenCodeClientAdapter(sdkClient(created), {
+      endpoint,
+      fetchImpl: (async (url: string, init: any) => {
+        requests.push({ url, init })
+        return jsonResponse({ choices: [{ message: { content } }] })
+      }) as any,
+    })
+    const signal = new AbortController().signal
+
+    await expect(adapter.generate(input(signal))).resolves.toEqual({
+      decision: "allow",
+      reasonCode: "safe",
+      reason: "Safe operation.",
+    })
+
+    expect(created).toEqual([])
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.url).toBe("http://localhost:8080/v1/chat/completions")
+    expect(requests[0]!.init.method).toBe("POST")
+    expect(requests[0]!.init.headers).toEqual({
+      "Content-Type": "application/json",
+      Authorization: "Bearer local",
+    })
+    expect(requests[0]!.init.signal).toBe(signal)
+    expect(JSON.parse(requests[0]!.init.body)).toEqual({
+      model: "reviewer-model",
+      messages: [
+        { role: "system", content: REVIEWER_SYSTEM_PROMPT },
+        { role: "user", content: "review this" },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "permission_decision", strict: true, schema: DECISION_SCHEMA },
+      },
+    })
+  })
+
+  test("uses the SDK path for a different provider", async () => {
+    const created: string[] = []
+    const adapter = new OpenCodeClientAdapter(sdkClient(created), {
+      endpoint,
+      fetchImpl: (async () => { throw new Error("fetch must not be called") }) as any,
+    })
+
+    await adapter.generate(input(undefined, { model: { providerID: "other", id: "m" } }))
+
+    expect(created).toEqual(["create"])
+  })
+
+  test("reads the key from the named environment variable", async () => {
+    process.env.TEST_STRUCTURED_KEY = "from-env"
+    try {
+      const headers: any[] = []
+      const adapter = new OpenCodeClientAdapter(sdkClient([]), {
+        endpoint: { providerID: "router", baseURL: "http://localhost:8080/v1", apiKeyEnv: "TEST_STRUCTURED_KEY" },
+        fetchImpl: (async (_url: string, init: any) => {
+          headers.push(init.headers)
+          return jsonResponse({ choices: [{ message: { content } }] })
+        }) as any,
+      })
+      await adapter.generate(input())
+      expect(headers[0].Authorization).toBe("Bearer from-env")
+    } finally {
+      delete process.env.TEST_STRUCTURED_KEY
+    }
+  })
+
+  test("omits Authorization when no key resolves", async () => {
+    const headers: any[] = []
+    const adapter = new OpenCodeClientAdapter(sdkClient([]), {
+      endpoint: { providerID: "router", baseURL: "http://localhost:8080/v1" },
+      fetchImpl: (async (_url: string, init: any) => {
+        headers.push(init.headers)
+        return jsonResponse({ choices: [{ message: { content } }] })
+      }) as any,
+    })
+    await adapter.generate(input())
+    expect(headers[0]).toEqual({ "Content-Type": "application/json" })
+  })
+
+  test("reports the HTTP status and error message on a non-2xx response", async () => {
+    const adapter = new OpenCodeClientAdapter(sdkClient([]), {
+      endpoint,
+      fetchImpl: (async () => jsonResponse({ error: { message: "model overloaded" } }, 503)) as any,
+    })
+    await expect(adapter.generate(input())).rejects.toThrow(
+      "Structured endpoint request failed (HTTP 503): model overloaded",
+    )
+  })
+
+  test("throws when a 200 response has no content", async () => {
+    for (const body of [{ choices: [] }, { choices: [{ message: { content: "" } }] }]) {
+      const adapter = new OpenCodeClientAdapter(sdkClient([]), {
+        endpoint,
+        fetchImpl: (async () => jsonResponse(body)) as any,
+      })
+      await expect(adapter.generate(input())).rejects.toThrow(/Structured endpoint returned no content/)
+    }
+  })
+
+  test("propagates an abort from the signal", async () => {
+    const controller = new AbortController()
+    const adapter = new OpenCodeClientAdapter(sdkClient([]), {
+      endpoint,
+      fetchImpl: ((_url: string, init: any) => new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason))
+      })) as any,
+    })
+    const pending = adapter.generate(input(controller.signal))
+    controller.abort(new DOMException("Review aborted", "AbortError"))
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" })
   })
 })

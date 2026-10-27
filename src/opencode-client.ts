@@ -1,6 +1,7 @@
+import type { StructuredEndpoint } from "./config.ts"
 import type { ReviewModel, ReviewerClient } from "./types.ts"
 import { writeDiagnostic } from "./diagnostics.ts"
-import { DECISION_SCHEMA, REVIEWER_AGENT_ID } from "./agent.ts"
+import { DECISION_SCHEMA, REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -36,7 +37,11 @@ export function parseReviewerJson(text: string): unknown {
 export class OpenCodeClientAdapter implements ReviewerClient {
   constructor(
     private readonly client: any,
-    private readonly options: { diagnosticsPath?: string | undefined } = {},
+    private readonly options: {
+      diagnosticsPath?: string | undefined
+      endpoint?: StructuredEndpoint | undefined
+      fetchImpl?: typeof fetch
+    } = {},
   ) {}
 
   async prewarm(): Promise<void> {
@@ -64,6 +69,9 @@ export class OpenCodeClientAdapter implements ReviewerClient {
     location?: { directory?: string; workspaceID?: string }
     signal: AbortSignal
   }): Promise<unknown> {
+    if (this.options.endpoint && input.model.providerID === this.options.endpoint.providerID) {
+      return this.generateViaEndpoint(this.options.endpoint, input)
+    }
     if (typeof this.client.permission?.request?.list === "function") return this.generateCurrent(input)
     const stable = typeof this.client.postSessionIdPermissionsPermissionId === "function"
     const session = stable ? this.client.session : (this.client.v2?.session ?? this.client.session)
@@ -198,6 +206,46 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       if (isNotFound(error)) return "not_found"
       throw error
     }
+  }
+
+  // Direct, tool-less HTTP call: no hidden reviewer session is created, and
+  // model.variant is ignored. No max_tokens, because a reasoning model spends
+  // tokens before the content and a cap would return empty content; timeoutMs
+  // already bounds the runtime.
+  private async generateViaEndpoint(
+    endpoint: StructuredEndpoint,
+    input: { prompt: string; model: ReviewModel; signal: AbortSignal },
+  ): Promise<unknown> {
+    const apiKey = endpoint.apiKey ?? (endpoint.apiKeyEnv ? process.env[endpoint.apiKeyEnv] : undefined)
+    const response = await (this.options.fetchImpl ?? fetch)(`${endpoint.baseURL.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: input.model.id,
+        messages: [
+          { role: "system", content: REVIEWER_SYSTEM_PROMPT },
+          { role: "user", content: input.prompt },
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "permission_decision", strict: true, schema: DECISION_SCHEMA },
+        },
+      }),
+      signal: input.signal,
+    })
+    const body: unknown = await response.json().catch(() => undefined)
+    if (!response.ok) {
+      const message = isRecord(body) && isRecord(body.error) && typeof body.error.message === "string"
+        ? body.error.message
+        : "no content"
+      throw new Error(`Structured endpoint request failed (HTTP ${response.status}): ${message}`)
+    }
+    const content = isRecord(body) && Array.isArray(body.choices) ? body.choices[0]?.message?.content : undefined
+    if (typeof content !== "string" || !content.trim()) throw new Error("Structured endpoint returned no content")
+    return parseReviewerJson(content)
   }
 
   private async generateCurrent(input: {

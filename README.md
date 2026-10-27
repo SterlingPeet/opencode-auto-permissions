@@ -132,6 +132,7 @@ The plugin tuple accepts these options:
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |
+| `structuredEndpoint` | unset | Send reviews for one OpenAI-compatible provider straight to its `/chat/completions` with a `json_schema` response format. `{ "providerID": "router", "baseURL": "http://localhost:8080/v1", "apiKey": "local" }`; `providerID` and `baseURL` are required, and `apiKey` or `apiKeyEnv` (an environment variable name) is optional, not both. Applies to every review whose model uses that provider, including a same-provider session fallback. `variant` is ignored on this path. It is a direct, tool-less HTTP call with no hidden reviewer session. |
 
 Start with `shadow: true` if you want to observe behavior before enabling automatic replies. Because options are an advanced manual configuration, set them in both files so the server and TUI receive identical settings. On OpenCode 2.1.4 and 2.2.0 the TUI takes plugin options only from `cli.json` `plugins` entries (`{ "package": ..., "options": ... }`); a plugin registered only in `opencode.json` reaches the TUI as a bare name, so its reviewer silently runs with default options.
 

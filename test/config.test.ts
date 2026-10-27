@@ -13,6 +13,7 @@ describe("parseConfig", () => {
       sessionApprovals: true,
       runtime: "auto",
       diagnosticsPath: undefined,
+      structuredEndpoint: undefined,
     })
   })
 
@@ -61,5 +62,25 @@ describe("parseConfig", () => {
     expect(parseConfig({ model: "a/b", debug: true }).diagnosticsPath).toEndWith("opencode/auto-permissions/decisions.jsonl")
     expect(parseConfig({ model: "a/b", debug: "/tmp/decisions.jsonl" }).diagnosticsPath).toBe("/tmp/decisions.jsonl")
     expect(() => parseConfig({ model: "a/b", debug: 1 })).toThrow(/debug/)
+  })
+
+  test("accepts an optional structured endpoint", () => {
+    expect(parseConfig({}).structuredEndpoint).toBeUndefined()
+    expect(parseConfig({
+      structuredEndpoint: { providerID: "router", baseURL: "http://localhost:8080/v1", apiKey: "local" },
+    }).structuredEndpoint).toEqual({ providerID: "router", baseURL: "http://localhost:8080/v1", apiKey: "local" })
+    expect(parseConfig({
+      structuredEndpoint: { providerID: "router", baseURL: "http://localhost:8080/v1", apiKeyEnv: "ROUTER_KEY" },
+    }).structuredEndpoint?.apiKeyEnv).toBe("ROUTER_KEY")
+  })
+
+  test("rejects an invalid structured endpoint", () => {
+    const valid = { providerID: "router", baseURL: "http://localhost:8080/v1" }
+    expect(() => parseConfig({ structuredEndpoint: "router" })).toThrow(/structuredEndpoint/)
+    expect(() => parseConfig({ structuredEndpoint: { ...valid, providerID: "" } })).toThrow(/providerID/)
+    expect(() => parseConfig({ structuredEndpoint: { baseURL: valid.baseURL } })).toThrow(/providerID/)
+    expect(() => parseConfig({ structuredEndpoint: { ...valid, baseURL: " " } })).toThrow(/baseURL/)
+    expect(() => parseConfig({ structuredEndpoint: { ...valid, apiKey: "a", apiKeyEnv: "B" } })).toThrow(/apiKey/)
+    expect(() => parseConfig({ structuredEndpoint: { ...valid, apiKey: 1 } })).toThrow(/apiKey/)
   })
 })
