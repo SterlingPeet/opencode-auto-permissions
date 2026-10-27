@@ -220,7 +220,18 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       const strictPrompt = `${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
       const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal })
       if (!isRecord(result) || typeof result.text !== "string") throw new Error("OpenCode reviewer returned no text output")
-      return parseReviewerJson(result.text)
+      try {
+        return parseReviewerJson(result.text)
+      } catch {}
+      // generate() has no structured-output option and does not mutate the
+      // session, so the model never sees its first reply: this is an
+      // independent retry with a stricter instruction, not a follow-up.
+      const retry = await this.client.session.generate({
+        sessionID,
+        prompt: `${strictPrompt}\n\nReply with only the JSON object, beginning with {"decision": and nothing before or after it.`,
+      }, { signal: input.signal })
+      if (!isRecord(retry) || typeof retry.text !== "string") throw new Error("OpenCode reviewer returned no text output")
+      return parseReviewerJson(retry.text)
     } finally {
       input.signal.removeEventListener("abort", abortRemote)
       if (sessionID) await Promise.resolve(this.client.session.remove({ sessionID })).catch(() => undefined)

@@ -521,7 +521,7 @@ describe("parseReviewerJson", () => {
   })
 })
 
-describe("OpenCodeClientAdapter V2 generate", () => {
+describe("OpenCodeClientAdapter V2 generate re-ask", () => {
   const model = { providerID: "example", id: "local" }
   const decision = '{"decision":"deny","reasonCode":"risky","reason":"Risky operation."}'
 
@@ -540,9 +540,9 @@ describe("OpenCodeClientAdapter V2 generate", () => {
     })
   }
 
-  test("parses a fenced reply", async () => {
+  test("re-asks once with a sharper instruction when the first reply is prose", async () => {
     const prompts: string[] = []
-    const adapter = adapterWith(["```json\n" + decision + "\n```"], prompts)
+    const adapter = adapterWith(["Sure, I would deny that.", decision], prompts)
 
     await expect(adapter.generate({
       prompt: "review",
@@ -550,11 +550,23 @@ describe("OpenCodeClientAdapter V2 generate", () => {
       parentSessionID: "ses_parent",
       signal: new AbortController().signal,
     })).resolves.toEqual({ decision: "deny", reasonCode: "risky", reason: "Risky operation." })
+
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]).toContain("Reply with only the JSON object")
+  })
+
+  test("does not re-ask when the first reply parses", async () => {
+    const prompts: string[] = []
+    const adapter = adapterWith([decision], prompts)
+
+    await adapter.generate({ prompt: "review", model, parentSessionID: "ses_parent", signal: new AbortController().signal })
+
     expect(prompts).toHaveLength(1)
   })
 
-  test("throws on a prose reply", async () => {
-    const adapter = adapterWith(["no json here"], [])
+  test("throws when the re-ask is also prose", async () => {
+    const prompts: string[] = []
+    const adapter = adapterWith(["no json here", "still no json"], prompts)
 
     await expect(adapter.generate({
       prompt: "review",
@@ -562,5 +574,6 @@ describe("OpenCodeClientAdapter V2 generate", () => {
       parentSessionID: "ses_parent",
       signal: new AbortController().signal,
     })).rejects.toBeInstanceOf(SyntaxError)
+    expect(prompts).toHaveLength(2)
   })
 })
