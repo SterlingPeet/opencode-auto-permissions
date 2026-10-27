@@ -14,6 +14,7 @@ export interface DiagnosticRecord {
     | "model_attempt"
     | "model_failure"
     | "model_decision"
+    | "reviewer_reask"
     | "request_received"
     | "request_cancelled"
     | "decision"
@@ -45,6 +46,7 @@ export interface DiagnosticRecord {
   modelID?: string
   variant?: string
   attempt?: number
+  textLength?: number
   clientCapabilities?: string[]
 }
 
