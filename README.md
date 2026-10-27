@@ -23,7 +23,7 @@ Older stable builds use `opencode plugin -g opencode-auto-permissions` instead.
 
 That is the complete plugin installation. You do not need to clone this repository, install Bun, run `npm install`, choose a reviewer model, or edit plugin entries manually.
 
-OpenCode downloads the package, detects its separate server and TUI targets, and registers `opencode-auto-permissions` in your global plugin configuration (`~/.config/opencode/opencode.json` on current builds; older V2 betas also added a TUI entry to `~/.config/opencode/cli.json`).
+OpenCode downloads the package, detects its separate server and TUI targets, and registers `opencode-auto-permissions` in your global plugin configuration (`~/.config/opencode/opencode.json` on current builds; the TUI reads plugin options only from `plugins` entries in `~/.config/opencode/cli.json`, so a setup with options needs both files; see Configuration).
 
 Quit and restart OpenCode after installation because configuration is loaded at startup. Auto Permissions automatically uses the model and variant selected by the session that requested the action. It also detects whether the server or TUI integration owns permission review, so only one reviewer handles each request.
 
@@ -69,7 +69,7 @@ Restart OpenCode after updating. If you use an advanced options tuple, confirm t
 
 ## Uninstall
 
-Remove `opencode-auto-permissions` with `opencode plugin remove opencode-auto-permissions`, or remove its entry from the plugin array in `~/.config/opencode/opencode.json` (and from `~/.config/opencode/cli.json` on older V2 betas), then restart OpenCode.
+Remove `opencode-auto-permissions` with `opencode plugin remove opencode-auto-permissions`, or remove its entry from the plugin array in `~/.config/opencode/opencode.json` (and from the `plugins` array in `~/.config/opencode/cli.json` if you added it), then restart OpenCode.
 
 Remove only this package's entries; leave other plugins and configuration unchanged.
 
@@ -133,9 +133,9 @@ The plugin tuple accepts these options:
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |
 
-Start with `shadow: true` if you want to observe behavior before enabling automatic replies. Because options are an advanced manual configuration, edit both generated entries so the server and TUI receive identical settings.
+Start with `shadow: true` if you want to observe behavior before enabling automatic replies. Because options are an advanced manual configuration, set them in both files so the server and TUI receive identical settings. On OpenCode 2.1.4 and 2.2.0 the TUI takes plugin options only from `cli.json` `plugins` entries (`{ "package": ..., "options": ... }`); a plugin registered only in `opencode.json` reaches the TUI as a bare name, so its reviewer silently runs with default options.
 
-No configuration tuple is required. To override the automatic session-model selection with a dedicated reviewer model, or to use other advanced options, replace the package string in both generated plugin entries with the same options tuple:
+No configuration tuple is required. To override the automatic session-model selection with a dedicated reviewer model, or to use other advanced options, set the same options in `opencode.json` (as a tuple) and in `cli.json` (as a `plugins` entry):
 
 ```json
 [
@@ -144,7 +144,11 @@ No configuration tuple is required. To override the automatic session-model sele
 ]
 ```
 
-Keep the entries in `~/.config/opencode/opencode.json` and, on older V2 betas that use it, `~/.config/opencode/cli.json` synchronized. A fast, reliable model that follows JSON instructions works best; deep reasoning adds unnecessary latency for permission review. Restart OpenCode after changing either file.
+```json
+{ "plugins": [{ "package": "opencode-auto-permissions", "options": { "model": "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731", "variant": "none" } }] }
+```
+
+Keep the entries in `~/.config/opencode/opencode.json` and `~/.config/opencode/cli.json` synchronized, with an identical `package` string (for a local install, the same path with no trailing slash). A fast, reliable model that follows JSON instructions works best; deep reasoning adds unnecessary latency for permission review. Restart OpenCode after changing either file.
 
 With `debug: true`, diagnostics are written to `$XDG_STATE_HOME/opencode/auto-permissions/decisions.jsonl` (normally `~/.local/state/opencode/auto-permissions/decisions.jsonl`). Records include action type, timing, verdict, reason, reply result, and failure category. Commands, paths, tool inputs, and conversation text are not logged.
 
