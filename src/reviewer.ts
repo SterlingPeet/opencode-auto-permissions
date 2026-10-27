@@ -28,7 +28,7 @@ export interface ReviewerOverrides {
 
 export function installReviewer(context: RuntimeContext, overrides: ReviewerOverrides = {}): () => void {
   const config = parseConfig(context.options)
-  const client = overrides.client ?? new OpenCodeClientAdapter(context.client, { diagnosticsPath: config.diagnosticsPath })
+  const client = overrides.client ?? new OpenCodeClientAdapter(context.client, { diagnosticsPath: config.diagnosticsPath, endpoint: config.structuredEndpoint })
   const inFlight = new Map<string, AbortController>()
   const sharedReviews = new Map<string, Promise<Decision>>()
   const sessionApprovals = new Set<string>()
