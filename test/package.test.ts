@@ -15,7 +15,7 @@ describe("built package", () => {
   })
 
   test("exports both current-beta and transitional TUI entrypoints", async () => {
-    const build = Bun.spawn(["bun", "run", "build"], { cwd: resolve(import.meta.dir, "..") })
+    const build = Bun.spawn(["bun", "run", "bundle"], { cwd: resolve(import.meta.dir, "..") })
     expect(await build.exited).toBe(0)
 
     const mod = await import(resolve(dist, "tui.js") + `?test=${Date.now()}`)
