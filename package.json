@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-permissions",
-  "version": "0.2.15-sterling.1",
+  "version": "0.2.15-sterling.2",
   "description": "Automatic, context-aware permission review for OpenCode",
   "type": "module",
   "license": "MIT",
@@ -27,13 +27,13 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/server.ts src/tui.ts src/v1-server.ts --outdir dist --target bun --format esm",
+    "bundle": "rm -rf dist && bun build src/server.ts src/tui.ts src/v1-server.ts --outdir dist --target bun --format esm",
     "check": "tsc --noEmit",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
     "test:stable": "bun run scripts/test-runtime.ts stable",
     "test:v2": "bun run scripts/test-runtime.ts v2",
-    "verify": "bun run check && bun run test && bun run build && bun run test:package",
+    "verify": "bun run check && bun run test && bun run bundle && bun run test:package",
     "test:package": "bun test test/package.test.ts"
   },
   "keywords": [

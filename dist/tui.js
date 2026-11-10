@@ -1543,7 +1543,7 @@ function isRecord4(value) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.2.15-sterling.1";
+var PLUGIN_VERSION = "0.2.15-sterling.2";
 
 // src/tui.ts
 var id = "opencode.auto-permissions";
