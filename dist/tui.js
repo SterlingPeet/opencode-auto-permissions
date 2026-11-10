@@ -1,5 +1,24 @@
 // @bun
+var __defProp = Object.defineProperty;
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, {
+      get: all[name],
+      enumerable: true,
+      configurable: true,
+      set: __exportSetter.bind(all, name)
+    });
+};
+
 // node_modules/@opencode-ai/plugin/dist/tui/plugin.js
+var exports_plugin = {};
+__export(exports_plugin, {
+  define: () => define
+});
 function define(plugin) {
   return plugin;
 }
@@ -71,18 +90,18 @@ function children(fn) {
   };
   return memo;
 }
-function resolveChildren(children) {
-  if (typeof children === "function" && !children.length)
-    return resolveChildren(children());
-  if (Array.isArray(children)) {
+function resolveChildren(children2) {
+  if (typeof children2 === "function" && !children2.length)
+    return resolveChildren(children2());
+  if (Array.isArray(children2)) {
     const results = [];
-    for (let i = 0;i < children.length; i++) {
-      const result = resolveChildren(children[i]);
+    for (let i = 0;i < children2.length; i++) {
+      const result = resolveChildren(children2[i]);
       Array.isArray(result) ? results.push.apply(results, result) : results.push(result);
     }
     return results;
   }
-  return children;
+  return children2;
 }
 function createProvider(id) {
   return function provider(props) {
@@ -382,7 +401,8 @@ function parseConfig(options) {
     shadow: options.shadow === true,
     sessionApprovals: options.sessionApprovals !== false,
     runtime: parseRuntime(options.runtime),
-    diagnosticsPath: parseDiagnosticsPath(options.debug)
+    diagnosticsPath: parseDiagnosticsPath(options.debug),
+    structuredEndpoint: parseStructuredEndpoint(options.structuredEndpoint)
   };
 }
 function parseModel(value, variant) {
@@ -416,6 +436,35 @@ function parseDiagnosticsPath(value) {
   if (typeof value === "string" && value.trim())
     return value.trim();
   throw new Error("Auto Permissions debug must be true, false, or a file path");
+}
+function parseStructuredEndpoint(value) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Auto Permissions structuredEndpoint must be an object");
+  }
+  const record = value;
+  const providerID = requiredString(record.providerID, "structuredEndpoint.providerID");
+  const baseURL = requiredString(record.baseURL, "structuredEndpoint.baseURL");
+  const apiKey = optionalString(record.apiKey, "structuredEndpoint.apiKey");
+  const apiKeyEnv = optionalString(record.apiKeyEnv, "structuredEndpoint.apiKeyEnv");
+  if (apiKey !== undefined && apiKeyEnv !== undefined) {
+    throw new Error("Auto Permissions structuredEndpoint accepts at most one of apiKey and apiKeyEnv");
+  }
+  return {
+    providerID,
+    baseURL,
+    ...apiKey !== undefined ? { apiKey } : {},
+    ...apiKeyEnv !== undefined ? { apiKeyEnv } : {}
+  };
+}
+function requiredString(value, name) {
+  if (typeof value === "string" && value.trim())
+    return value.trim();
+  throw new Error(`Auto Permissions ${name} must be a non-empty string`);
+}
+function optionalString(value, name) {
+  return value === undefined ? undefined : requiredString(value, name);
 }
 function parseRuntime(value) {
   if (value === undefined)
@@ -489,11 +538,27 @@ var REVIEWER_PERMISSIONS = [
 ];
 var REVIEWER_DIRECTORY = join2(tmpdir(), "opencode-auto-permissions", "reviewer");
 var REVIEWER_SESSION_TITLE = "Auto Permissions review";
+function parseReviewerJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (strictError) {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {}
+    }
+    throw strictError;
+  }
+}
 
 class OpenCodeClientAdapter {
   client;
-  constructor(client) {
+  options;
+  constructor(client, options = {}) {
     this.client = client;
+    this.options = options;
   }
   async prewarm() {
     await mkdir2(REVIEWER_DIRECTORY, { recursive: true });
@@ -518,6 +583,9 @@ class OpenCodeClientAdapter {
     await Promise.all(requests);
   }
   async generate(input) {
+    if (this.options.endpoint && input.model.providerID === this.options.endpoint.providerID) {
+      return this.generateViaEndpoint(this.options.endpoint, input);
+    }
     if (typeof this.client.permission?.request?.list === "function")
       return this.generateCurrent(input);
     const stable = typeof this.client.postSessionIdPermissionsPermissionId === "function";
@@ -598,7 +666,7 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
         };
         const fallbackInput = stable ? { path: { id: sessionID }, query: location, body: fallbackBody } : { sessionID, ...location, ...fallbackBody };
         const result = unwrapData(await session.prompt(fallbackInput, { signal: input.signal }));
-        return JSON.parse(assistantText(result));
+        return parseReviewerJson(assistantText(result));
       }
     } finally {
       input.signal.removeEventListener("abort", abortRemote);
@@ -624,8 +692,8 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       const scoped = this.client.v2?.session?.permission ?? this.client.session?.permission;
       if (input.protocol === "v2" && typeof scoped?.reply === "function") {
         try {
-          const result = await scoped.reply(input);
-          throwForResultError(result);
+          const result2 = await scoped.reply(input);
+          throwForResultError(result2);
           return "replied";
         } catch (error) {
           if (!isNotFound(error) || typeof this.client.permission?.reply !== "function")
@@ -646,6 +714,39 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
         return "not_found";
       throw error;
     }
+  }
+  async generateViaEndpoint(endpoint, input) {
+    const apiKey = endpoint.apiKey ?? (endpoint.apiKeyEnv ? process.env[endpoint.apiKeyEnv] : undefined);
+    const response = await (this.options.fetchImpl ?? fetch)(`${endpoint.baseURL.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+      },
+      body: JSON.stringify({
+        model: input.model.id,
+        messages: [
+          { role: "system", content: REVIEWER_SYSTEM_PROMPT },
+          { role: "user", content: input.prompt }
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "permission_decision", strict: true, schema: DECISION_SCHEMA }
+        }
+      }),
+      signal: input.signal
+    });
+    const body = await response.json().catch(() => {
+      return;
+    });
+    if (!response.ok) {
+      const message = isRecord2(body) && isRecord2(body.error) && typeof body.error.message === "string" ? body.error.message : "no content";
+      throw new Error(`Structured endpoint request failed (HTTP ${response.status}): ${message}`);
+    }
+    const content = isRecord2(body) && Array.isArray(body.choices) ? body.choices[0]?.message?.content : undefined;
+    if (typeof content !== "string" || !content.trim())
+      throw new Error("Structured endpoint returned no content");
+    return parseReviewerJson(content);
   }
   async generateCurrent(input) {
     await mkdir2(REVIEWER_DIRECTORY, { recursive: true });
@@ -675,7 +776,25 @@ Return only one JSON object without Markdown fences with exactly these keys: "de
       const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal });
       if (!isRecord2(result) || typeof result.text !== "string")
         throw new Error("OpenCode reviewer returned no text output");
-      return JSON.parse(result.text);
+      try {
+        return parseReviewerJson(result.text);
+      } catch {}
+      writeDiagnostic(this.options.diagnosticsPath, {
+        timestamp: new Date().toISOString(),
+        event: "reviewer_reask",
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        textLength: result.text.length
+      });
+      const retry = await this.client.session.generate({
+        sessionID,
+        prompt: `${strictPrompt}
+
+Reply with only the JSON object, beginning with {"decision": and nothing before or after it.`
+      }, { signal: input.signal });
+      if (!isRecord2(retry) || typeof retry.text !== "string")
+        throw new Error("OpenCode reviewer returned no text output");
+      return parseReviewerJson(retry.text);
     } finally {
       input.signal.removeEventListener("abort", abortRemote);
       if (sessionID)
@@ -865,7 +984,7 @@ function isRecord3(value) {
 // src/reviewer.ts
 function installReviewer(context, overrides = {}) {
   const config = parseConfig(context.options);
-  const client = overrides.client ?? new OpenCodeClientAdapter(context.client);
+  const client = overrides.client ?? new OpenCodeClientAdapter(context.client, { diagnosticsPath: config.diagnosticsPath, endpoint: config.structuredEndpoint });
   const inFlight = new Map;
   const sharedReviews = new Map;
   const sessionApprovals = new Set;
@@ -976,13 +1095,13 @@ async function reviewAndReply(context, client, config, request, parentSignal, ov
     return;
   if (decision.kind === "allow" || decision.kind === "allow_session") {
     const reply = decision.kind === "allow_session" && eligibleForSessionApproval(config, request, input) ? "always" : "once";
-    const result = await client.reply({
+    const result2 = await client.reply({
       sessionID: request.sessionID,
       requestID: request.id,
       reply,
       protocol: request.protocol
     });
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result, reply === "always" ? "session" : "once");
+    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result2, reply === "always" ? "session" : "once");
     return;
   }
   const result = await client.reply({
@@ -1204,7 +1323,7 @@ function sameModelId(left, right) {
 }
 
 // src/stable.ts
-function createStableRuntime(injectedClient, options, directory) {
+function createStableRuntime(injectedClient, options, directory2) {
   const client = compatibleClient(injectedClient);
   const listeners = new Map;
   const sessions = new Map;
@@ -1222,11 +1341,11 @@ function createStableRuntime(injectedClient, options, directory) {
       handler(event);
   };
   const syncMessages = async (sessionID) => {
-    const result = unwrap(await client.session.messages({ path: { id: sessionID }, query: { directory, limit: 200 } }));
+    const result = unwrap(await client.session.messages({ path: { id: sessionID }, query: { directory: directory2, limit: 200 } }));
     messages.set(sessionID, Array.isArray(result) ? result : []);
   };
   const syncPermissions = async () => {
-    const result = unwrap(await client.permission.list({ directory }));
+    const result = unwrap(await client.permission.list({ directory: directory2 }));
     if (!Array.isArray(result))
       return;
     pending.clear();
@@ -1243,7 +1362,7 @@ function createStableRuntime(injectedClient, options, directory) {
       seen.add(current);
       let session = sessions.get(current);
       if (!session) {
-        const result = unwrap(await client.session.get({ path: { id: current }, query: { directory } }));
+        const result = unwrap(await client.session.get({ path: { id: current }, query: { directory: directory2 } }));
         if (!isRecord4(result) || typeof result.id !== "string")
           return sessionID;
         session = {
@@ -1278,13 +1397,13 @@ function createStableRuntime(injectedClient, options, directory) {
           })
         }
       },
-      location: { default: () => ({ directory }) }
+      location: { default: () => ({ directory: directory2 }) }
     },
-    location: { directory },
+    location: { directory: directory2 },
     showToast(input) {
       if (typeof client.tui?.showToast !== "function")
         return;
-      client.tui.showToast({ directory, ...input }).catch(() => {
+      client.tui.showToast({ directory: directory2, ...input }).catch(() => {
         return;
       });
     },
@@ -1293,13 +1412,13 @@ function createStableRuntime(injectedClient, options, directory) {
         return;
       const controller = new AbortController;
       resumeControllers.add(controller);
-      waitForIdle(client, sessionID, directory, controller.signal).then((idle) => {
+      waitForIdle(client, sessionID, directory2, controller.signal).then((idle) => {
         if (!idle || controller.signal.aborted)
           return;
         const routing = latestUserRouting(messages.get(sessionID) ?? []);
         return client.session.promptAsync({
           path: { id: sessionID },
-          query: { directory },
+          query: { directory: directory2 },
           body: {
             ...routing,
             parts: [{
@@ -1367,13 +1486,13 @@ function latestUserRouting(messages) {
   }
   return {};
 }
-async function waitForIdle(client, sessionID, directory, signal) {
+async function waitForIdle(client, sessionID, directory2, signal) {
   if (typeof client.session?.status !== "function") {
     await delay(250, signal);
     return !signal.aborted;
   }
   for (let attempt = 0;attempt < 50 && !signal.aborted; attempt++) {
-    const statuses = unwrap(await client.session.status({ query: { directory } }));
+    const statuses = unwrap(await client.session.status({ query: { directory: directory2 } }));
     if (!isRecord4(statuses) || !isRecord4(statuses[sessionID]) || statuses[sessionID].type === "idle")
       return true;
     await delay(100, signal);
@@ -1424,11 +1543,11 @@ function isRecord4(value) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.2.15";
+var PLUGIN_VERSION = "0.2.15-sterling.1";
 
 // src/tui.ts
 var id = "opencode.auto-permissions";
-var plugin = define({
+var plugin = exports_plugin.define({
   id,
   setup(context) {
     return installReviewer(fromContext(context), { protocols: ["v2"] });
@@ -1639,7 +1758,7 @@ async function resumeLegacySession(api, sessionID, reason) {
   } catch {}
 }
 export {
-  tui_default as default,
+  tui,
   id,
-  tui
+  tui_default as default
 };
