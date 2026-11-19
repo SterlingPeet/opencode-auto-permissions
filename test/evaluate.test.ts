@@ -126,6 +126,50 @@ describe("installEvaluateHook", () => {
     await dispose()
   })
 
+  test("lets a later identical call keep waiting on a shared review after the first call's deadline", async () => {
+    const app = harness({ timeoutMs: 300 })
+    // The first call's context lookup takes 150 ms, so the shared review
+    // starts then and answers at 400 ms: after the first call's 300 ms
+    // deadline, inside the second call's (200 + 300 ms) and the attempt's own.
+    const context = app.host.session.context
+    let lookups = 0
+    app.host.session.context = async (input) => {
+      if (++lookups === 1) await new Promise((resolve) => setTimeout(resolve, 150))
+      return context(input)
+    }
+    app.client.generate = async (input) => {
+      app.generated.push(input)
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      return ALLOW
+    }
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const first = app.evaluate()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const second = app.evaluate()
+
+    expect((await first).effect).toBe("ask")
+    expect((await second).effect).toBe("allow")
+    expect(app.generated).toHaveLength(1)
+    await dispose()
+  })
+
+  test("aborts a shared review once every waiting call has given up", async () => {
+    const app = harness({ timeoutMs: 100 })
+    const signals: AbortSignal[] = []
+    app.client.generate = (input) => {
+      signals.push(input.signal)
+      return new Promise(() => {})
+    }
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    await Promise.all([app.evaluate(), app.evaluate()])
+
+    expect(signals).toHaveLength(1)
+    expect(signals[0]?.aborted).toBeTrue()
+    await dispose()
+  })
+
   test("bounds a stalled context lookup by the same deadline", async () => {
     const app = harness({ timeoutMs: 100 })
     app.host.session.context = () => new Promise(() => {})

@@ -69,7 +69,7 @@ export async function installEvaluateHook(
   const config = parseConfig(host.options)
   if (!config.serverReview || config.shadow) return async () => {}
   const client = overrides.client ?? new ServerReviewerClient(host, config)
-  const state: ReviewState = { sharedReviews: new Map(), sessionApprovals: new Set() }
+  const state: ReviewState = { sharedReviews: new Map(), sessionApprovals: new Set(), releaseUnwatchedReviews: true }
   const disposed = new AbortController()
   const verdicts = new Map<string, Verdict>()
   const expiries = new Set<ReturnType<typeof setTimeout>>()
@@ -142,7 +142,9 @@ async function review(
   const stop = abortRejection(signal)
   try {
     const outcome = await Promise.race([
-      decide(runtimeContext(host), client, config, request, state, signal, signal),
+      // A shared model review outlives this caller's deadline (see
+      // ReviewState.releaseUnwatchedReviews), so only disposal bounds it here.
+      decide(runtimeContext(host), client, config, request, state, signal, disposedSignal),
       stop.promise,
     ])
     if (!outcome) throw stopError(deadline.signal)
