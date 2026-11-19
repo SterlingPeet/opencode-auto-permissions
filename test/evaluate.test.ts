@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, jest, test } from "bun:test"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -348,6 +348,71 @@ describe("installEvaluateHook", () => {
 
     expect([first.effect, second.effect]).toEqual(["ask", "allow"])
     expect(app.generated).toHaveLength(3)
+    await dispose()
+  })
+
+  test("forgets a call's verdict after 60 seconds", async () => {
+    jest.useFakeTimers()
+    try {
+      const app = harness()
+      const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+      await app.evaluate()
+      jest.advanceTimersByTime(59_000)
+      await app.evaluate()
+      expect(app.generated).toHaveLength(1)
+      jest.advanceTimersByTime(2_000)
+      await app.evaluate()
+      expect(app.generated).toHaveLength(2)
+      await dispose()
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  test("never lets allow_session become a reusable session approval", async () => {
+    const app = harness()
+    app.client.generate = async (input) => {
+      app.generated.push(input)
+      return { ...ALLOW, decision: "allow_session" }
+    }
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+    // A narrow read would be eligible if the hook passed its resources as patterns.
+    const read = (id: string) =>
+      app.evaluate({ action: "read", resources: ["src/a.ts"], source: { type: "tool", messageID: "msg_other", id } })
+
+    await read("call_8")
+    await read("call_9")
+
+    expect(app.generated).toHaveLength(2)
+    await dispose()
+  })
+
+  test("leaves the call at ask when the hook itself throws", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    // A BigInt cannot be serialized, so building the reuse key throws.
+    const event = await app.evaluate({ metadata: { size: 1n } })
+
+    expect(event.effect).toBe("ask")
+    expect(event.message).toBe(`${REVIEW_ESCALATED_PREFIX}: the review failed, so this request needs your approval.`)
+    await dispose()
+  })
+
+  test("ends a pending review when the plugin is disposed", async () => {
+    const app = harness({ timeoutMs: 5_000 })
+    app.client.generate = () => new Promise(() => {})
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const pending = app.evaluate()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const startedAt = performance.now()
+    await dispose()
+    const event = await pending
+
+    expect(performance.now() - startedAt).toBeLessThan(1_000)
+    expect(event.effect).toBe("ask")
     await dispose()
   })
 
