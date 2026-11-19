@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { DECISION_SCHEMA, REVIEWER_SYSTEM_PROMPT } from "../src/agent.ts"
 import { OpenCodeClientAdapter, parseReviewerJson } from "../src/opencode-client.ts"
+import { PLUGIN_VERSION } from "../src/version.ts"
 import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -804,6 +805,8 @@ describe("OpenCodeClientAdapter structured endpoint", () => {
     expect(requests[0]!.init.method).toBe("POST")
     expect(requests[0]!.init.headers).toEqual({
       "Content-Type": "application/json",
+      "User-Agent": `opencode-auto-permissions/${PLUGIN_VERSION}`,
+      "x-attended": "true",
       Authorization: "Bearer local",
       "x-parent-session-id": "ses_parent",
     })
@@ -818,6 +821,7 @@ describe("OpenCodeClientAdapter structured endpoint", () => {
         type: "json_schema",
         json_schema: { name: "permission_decision", strict: true, schema: DECISION_SCHEMA },
       },
+      chat_template_kwargs: { enable_thinking: false },
     })
   })
 
@@ -861,7 +865,12 @@ describe("OpenCodeClientAdapter structured endpoint", () => {
       }) as any,
     })
     await adapter.generate(input())
-    expect(headers[0]).toEqual({ "Content-Type": "application/json", "x-parent-session-id": "ses_parent" })
+    expect(headers[0]).toEqual({
+      "Content-Type": "application/json",
+      "User-Agent": `opencode-auto-permissions/${PLUGIN_VERSION}`,
+      "x-attended": "true",
+      "x-parent-session-id": "ses_parent",
+    })
   })
 
   test.each([["has a space", "ses parent"], ["is too long", `ses_${"a".repeat(61)}`], ["is empty", ""]])(
@@ -876,7 +885,11 @@ describe("OpenCodeClientAdapter structured endpoint", () => {
         }) as any,
       })
       await adapter.generate(input(undefined, { parentSessionID }))
-      expect(headers[0]).toEqual({ "Content-Type": "application/json" })
+      expect(headers[0]).toEqual({
+        "Content-Type": "application/json",
+        "User-Agent": `opencode-auto-permissions/${PLUGIN_VERSION}`,
+        "x-attended": "true",
+      })
     },
   )
 

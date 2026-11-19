@@ -2,6 +2,7 @@ import type { StructuredEndpoint } from "./config.ts"
 import type { ReviewModel, ReviewerClient } from "./types.ts"
 import { writeDiagnostic } from "./diagnostics.ts"
 import { DECISION_SCHEMA, REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
+import { PLUGIN_VERSION } from "./version.ts"
 import { randomUUID } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -268,6 +269,10 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        // Named client, because a fetch with no User-Agent shows up in router logs as an unnamed client.
+        "User-Agent": `opencode-auto-permissions/${PLUGIN_VERSION}`,
+        // A person is waiting on every permission review, and router-next rejects a non-gate model without this header.
+        "x-attended": "true",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         // Attributes the gate call to the session whose tool call it judges. No
         // x-session-affinity of its own, because a review is a one-shot judgement.
@@ -283,6 +288,9 @@ export class OpenCodeClientAdapter implements ReviewerClient {
           type: "json_schema",
           json_schema: { name: "permission_decision", strict: true, schema: DECISION_SCHEMA },
         },
+        // A permission verdict needs no chain of thought, and the schema already constrains the output;
+        // vLLM, SGLang and llama.cpp read this, and the router forwards it.
+        chat_template_kwargs: { enable_thinking: false },
       }),
       signal: input.signal,
     })
