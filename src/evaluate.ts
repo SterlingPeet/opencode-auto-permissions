@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { parseConfig, type Config } from "./config.ts"
 import { REVIEW_ESCALATED_PREFIX } from "./context.ts"
@@ -54,9 +55,12 @@ function hasSource(event: PermissionEvaluation): event is SourcedEvaluation {
 
 type Verdict = { effect: PermissionEvaluation["effect"]; message?: string }
 
-// A tool can evaluate the same call more than once (webfetch asserts the URL,
-// then re-checks it with assertNotDenied before fetching), so a call's verdict
-// is reused for this long instead of reviewed again.
+// OpenCode can evaluate the same call more than once: automation authorize
+// (core/src/automation/code.ts) probes each tool with assertNotDenied and then
+// allows under the creating call's source, so a call's allow or deny is reused
+// for this long instead of reviewed again. The assert that follows those
+// probes carries metadata (the program), so it is a new key and gets its own
+// review. Webfetch re-checks only redirect targets, which are new resources.
 const CALL_VERDICT_TTL_MS = 60_000
 
 /**
@@ -108,7 +112,9 @@ export async function installEvaluateHook(
       const key = callKey(event)
       const reused = verdicts.get(key)
       const verdict = reused ?? (await review(host, client, config, state, event, disposed.signal))
-      if (!reused) remember(key, verdict)
+      // An escalation is not reused, so a later evaluation of the call gets a
+      // fresh review instead of a failure that may have been transient.
+      if (!reused && verdict.effect !== "ask") remember(key, verdict)
       apply(event, verdict)
     } catch (error) {
       apply(event, escalation(error))
@@ -198,8 +204,18 @@ function escalation(error: unknown): Verdict {
   }
 }
 
+// Nested Code Mode calls arrive with their parent's call ID, so the metadata
+// (the nested call's arguments) tells them apart.
 function callKey(event: SourcedEvaluation): string {
-  return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources])
+  const metadata = createHash("sha256").update(stableJson(event.metadata ?? null)).digest("hex")
+  return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources, metadata])
+}
+
+/** JSON with object keys sorted, so equal metadata always hashes the same. */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    isRecord(item) ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => (left < right ? -1 : 1))) : item,
+  )
 }
 
 function stopError(deadline: AbortSignal): Error {

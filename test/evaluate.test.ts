@@ -291,6 +291,66 @@ describe("installEvaluateHook", () => {
     await dispose()
   })
 
+  test.each([
+    ["session", { sessionID: "ses_other" }],
+    ["message", { source: { type: "tool" as const, messageID: "msg_next", id: "call_1" } }],
+    ["action", { action: "bash" }],
+    ["resources", { resources: ["git push origin main"] }],
+    ["metadata", { metadata: { url: "https://example.com/next" } }],
+  ])("reviews the same call ID again when its %s differs", async (_field, change) => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    await app.evaluate({ metadata: { url: "https://example.com/first" } })
+    await app.evaluate({ metadata: { url: "https://example.com/first" }, ...change })
+
+    expect(app.generated).toHaveLength(2)
+    await dispose()
+  })
+
+  test("reuses a verdict for equal metadata whatever its key order", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    await app.evaluate({ metadata: { url: "https://example.com", format: "text" } })
+    await app.evaluate({ metadata: { format: "text", url: "https://example.com" } })
+
+    expect(app.generated).toHaveLength(1)
+    await dispose()
+  })
+
+  test("reviews concurrent calls with different metadata separately", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+    // Both calls are missing from the context, so only their metadata differs.
+    const edit = (diff: string) =>
+      app.evaluate({ action: "edit", resources: ["src/a.ts"], metadata: { diff }, source: { type: "tool", messageID: "msg_other", id: "call_9" } })
+
+    await Promise.all([edit("+safe"), edit("+rm -rf build")])
+
+    expect(app.generated).toHaveLength(2)
+    await dispose()
+  })
+
+  test("does not reuse an escalation for a later evaluation of the call", async () => {
+    const app = harness()
+    let calls = 0
+    app.client.generate = async (input) => {
+      app.generated.push(input)
+      // Fails the dedicated model and its session-model fallback once.
+      if (++calls <= 2) throw new Error("provider unavailable")
+      return ALLOW
+    }
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const first = await app.evaluate()
+    const second = await app.evaluate()
+
+    expect([first.effect, second.effect]).toEqual(["ask", "allow"])
+    expect(app.generated).toHaveLength(3)
+    await dispose()
+  })
+
   test.each([{}, { serverReview: false }, { shadow: true }])("does not register a hook for %p", async (options) => {
     const app = harness({ serverReview: undefined, ...options, ...("shadow" in options ? { serverReview: true } : {}) })
     const dispose = await installEvaluateHook(app.host, { client: app.client })
