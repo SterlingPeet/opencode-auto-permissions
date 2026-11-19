@@ -12,12 +12,13 @@ import type {
   Decision,
   PermissionProtocol,
   PermissionRequest,
+  ReviewInput,
   ReviewModel,
   ReviewerClient,
   RuntimeContext,
 } from "./types.ts"
 import { parseDecision } from "./verdict.ts"
-import { describeError, failureCategory, writeDiagnostic } from "./diagnostics.ts"
+import { describeError, failureCategory, writeDiagnostic, type DiagnosticRecord } from "./diagnostics.ts"
 
 export interface ReviewerOverrides {
   client?: ReviewerClient
@@ -30,8 +31,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
   const config = parseConfig(context.options)
   const client = overrides.client ?? new OpenCodeClientAdapter(context.client, { diagnosticsPath: config.diagnosticsPath, endpoint: config.structuredEndpoint })
   const inFlight = new Map<string, AbortController>()
-  const sharedReviews = new Map<string, Promise<Decision>>()
-  const sessionApprovals = new Set<string>()
+  const state: ReviewState = { sharedReviews: new Map(), sessionApprovals: new Set() }
   const sharedReviewController = new AbortController()
   const configuredProtocols: PermissionProtocol[] = overrides.protocols ?? ["stable", "v2"]
   const protocols = new Set(configuredProtocols)
@@ -59,7 +59,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     const startedAt = performance.now()
     writeReceived(config, asked)
     inFlight.set(asked.id, controller)
-    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal)
+    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal)
       .catch(async (error) => {
         if (controller.signal.aborted) return
         await rejectAfterFailure(context, client, config, asked, startedAt, error, overrides)
@@ -79,7 +79,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     const startedAt = performance.now()
     writeReceived(config, asked)
     inFlight.set(asked.id, controller)
-    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal)
+    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal)
       .catch(async (error) => {
         if (controller.signal.aborted) return
         await rejectAfterFailure(context, client, config, asked, startedAt, error, overrides)
@@ -97,9 +97,72 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     for (const controller of inFlight.values()) controller.abort("plugin disposed")
     sharedReviewController.abort("plugin disposed")
     inFlight.clear()
-    sharedReviews.clear()
-    sessionApprovals.clear()
+    state.sharedReviews.clear()
+    state.sessionApprovals.clear()
   }
+}
+
+export interface ReviewState {
+  sharedReviews: Map<string, Promise<Decision>>
+  sessionApprovals: Set<string>
+}
+
+export type DecisionSource = "policy" | "model" | "session"
+
+export interface ReviewOutcome {
+  decision: Decision
+  source: DecisionSource
+  input: ReviewInput
+}
+
+/**
+ * Decides one permission request without replying to it: deterministic policy
+ * first, then a reusable session approval, then one model review shared by
+ * concurrent identical requests. Both the TUI reply path and the server
+ * evaluate hook call this, so they apply the same rules. Returns undefined
+ * when parentSignal aborts; reviewSignal bounds the model review itself.
+ */
+export async function decide(
+  context: RuntimeContext,
+  client: ReviewerClient,
+  config: Config,
+  request: PermissionRequest,
+  state: ReviewState,
+  parentSignal: AbortSignal,
+  reviewSignal: AbortSignal,
+): Promise<ReviewOutcome | undefined> {
+  const input = await collectReviewInput(context, request, config.userMessageCount)
+  if (parentSignal.aborted) return undefined
+
+  const policyDecision = applyDeterministicPolicy(input)
+  const approvalKey = reusableApprovalKey(config, request, input)
+  const cachedDecision = !policyDecision && approvalKey && state.sessionApprovals.has(approvalKey)
+    ? {
+        kind: "allow" as const,
+        reasonCode: "session_approval_reused",
+        reason: "Reuses an approved narrow pattern from this session.",
+      }
+    : undefined
+  const reviewKey = concurrentReviewKey(request, input)
+  let shared = state.sharedReviews.get(reviewKey)
+  if (!policyDecision && !cachedDecision && !shared) {
+    shared = modelDecision(context, client, config, input, reviewSignal)
+    state.sharedReviews.set(reviewKey, shared)
+    void shared.finally(() => {
+      if (state.sharedReviews.get(reviewKey) === shared) state.sharedReviews.delete(reviewKey)
+    }).catch(() => undefined)
+  }
+  const decision = policyDecision ?? cachedDecision ?? (await shared!)
+  if (parentSignal.aborted) return undefined
+
+  if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
+    state.sessionApprovals.add(approvalKey)
+  }
+  return { decision, source: decisionSource(policyDecision, cachedDecision), input }
+}
+
+export function denialMessage(reason: string): string {
+  return `Auto Permissions blocked this action: ${reason}`
 }
 
 async function reviewAndReply(
@@ -110,41 +173,16 @@ async function reviewAndReply(
   parentSignal: AbortSignal,
   overrides: ReviewerOverrides,
   startedAt: number,
-  sharedReviews: Map<string, Promise<Decision>>,
-  sessionApprovals: Set<string>,
+  state: ReviewState,
   sharedReviewSignal: AbortSignal,
 ): Promise<void> {
-  const input = await collectReviewInput(context, request, config.userMessageCount)
-  if (parentSignal.aborted) return
-
-  const policyDecision = applyDeterministicPolicy(input)
-  const approvalKey = reusableApprovalKey(config, request, input)
-  const cachedDecision = !policyDecision && approvalKey && sessionApprovals.has(approvalKey)
-    ? {
-        kind: "allow" as const,
-        reasonCode: "session_approval_reused",
-        reason: "Reuses an approved narrow pattern from this session.",
-      }
-    : undefined
-  const reviewKey = concurrentReviewKey(request, input)
-  let shared = sharedReviews.get(reviewKey)
-  if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context, client, config, input, sharedReviewSignal)
-    sharedReviews.set(reviewKey, shared)
-    void shared.finally(() => {
-      if (sharedReviews.get(reviewKey) === shared) sharedReviews.delete(reviewKey)
-    }).catch(() => undefined)
-  }
-  const decision = policyDecision ?? cachedDecision ?? (await shared!)
-  if (parentSignal.aborted) return
-
-  if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
-    sessionApprovals.add(approvalKey)
-  }
+  const outcome = await decide(context, client, config, request, state, parentSignal, sharedReviewSignal)
+  if (!outcome) return
+  const { decision, source, input } = outcome
 
   overrides.onDecision?.(request, decision, config.shadow)
   if (config.shadow) {
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision))
+    writeDecision(config, request, startedAt, decision, source)
     return
   }
 
@@ -161,15 +199,7 @@ async function reviewAndReply(
       reply,
       protocol: request.protocol,
     })
-    writeDecision(
-      config,
-      request,
-      startedAt,
-      decision,
-      decisionSource(policyDecision, cachedDecision),
-      result,
-      reply === "always" ? "session" : "once",
-    )
+    writeDecision(config, request, startedAt, decision, source, result, reply === "always" ? "session" : "once")
     return
   }
 
@@ -177,11 +207,11 @@ async function reviewAndReply(
     sessionID: request.sessionID,
     requestID: request.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${decision.reason}`,
+    message: denialMessage(decision.reason),
     protocol: request.protocol,
   })
   context.showToast?.({ title: "Blocked", message: decision.reason, variant: "warning", duration: 4_000 })
-  writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result)
+  writeDecision(config, request, startedAt, decision, source, result)
   if (result === "replied") context.resumeAfterDenial?.(request.sessionID, decision.reason)
 }
 
@@ -206,7 +236,7 @@ async function rejectAfterFailure(
     sessionID: request.sessionID,
     requestID: request.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${reason}`,
+    message: denialMessage(reason),
     protocol: request.protocol,
   })
   context.showToast?.({ title: "Blocked", message: reason, variant: "warning", duration: 4_000 })
@@ -250,7 +280,7 @@ function concurrentReviewKey(
 function decisionSource(
   policyDecision: Decision | null,
   cachedDecision: Decision | undefined,
-): "policy" | "model" | "session" {
+): DecisionSource {
   return policyDecision ? "policy" : cachedDecision ? "session" : "model"
 }
 
@@ -265,12 +295,17 @@ function isSensitiveTarget(value: string): boolean {
   return /(?:^|[\\/])(?:\.ssh|\.aws|\.gnupg|Keychains?|credentials?|tokens?)(?:[\\/]|$)|(?:^|[\\/])\.env(?:\.|$)/i.test(value)
 }
 
-function writeDecision(
+/** The request fields a decision-log record carries; protocol may be "evaluate". */
+export type LoggedRequest = Pick<PermissionRequest, "id" | "sessionID" | "action" | "resources"> & {
+  protocol: NonNullable<DiagnosticRecord["protocol"]>
+}
+
+export function writeDecision(
   config: Config,
-  request: PermissionRequest,
+  request: LoggedRequest,
   startedAt: number,
   decision: Decision,
-  source: "policy" | "model" | "session",
+  source: DecisionSource,
   replyResult?: "replied" | "not_found" | "manual",
   approvalScope?: "once" | "session",
 ): void {
@@ -293,7 +328,7 @@ function writeDecision(
   })
 }
 
-function writeFailure(config: Config, request: PermissionRequest, startedAt: number, error: unknown): void {
+export function writeFailure(config: Config, request: LoggedRequest, startedAt: number, error: unknown): void {
   const described = describeError(error)
   writeDiagnostic(config.diagnosticsPath, {
     timestamp: new Date().toISOString(),
@@ -313,7 +348,7 @@ function writeFailure(config: Config, request: PermissionRequest, startedAt: num
   })
 }
 
-function writeReceived(config: Config, request: PermissionRequest): void {
+export function writeReceived(config: Config, request: LoggedRequest): void {
   writeDiagnostic(config.diagnosticsPath, {
     timestamp: new Date().toISOString(),
     event: "request_received",
