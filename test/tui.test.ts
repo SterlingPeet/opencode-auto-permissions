@@ -125,6 +125,45 @@ describe("TUI plugin denial continuation", () => {
     expect(continuation).toContain("Do not retry the exact blocked action")
   })
 
+  test("leaves a denied subagent terminated instead of steering it", async () => {
+    const app = continuationHarness(() => "running")
+    app.app.data.session.get = ((id: string) =>
+      id === "ses_child" ? { id, parentID: "ses_root" } : { id }) as typeof app.app.data.session.get
+    ;(app.pending[0] as { sessionID: string }).sessionID = "ses_child"
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(app.replies).toHaveLength(1)
+    expect(app.replies[0]).toMatchObject({ sessionID: "ses_child", reply: "reject" })
+    expect(app.prompts).toEqual([])
+  })
+
+  test("does not resume a session with unknown parentage", async () => {
+    const app = continuationHarness(() => "running")
+    app.app.data.session.get = ((id: string) =>
+      id === "ses_missing" ? undefined : { id }) as typeof app.app.data.session.get
+    ;(app.pending[0] as { sessionID: string }).sessionID = "ses_missing"
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(app.replies).toHaveLength(1)
+    expect(app.prompts).toEqual([])
+  })
+
+  test("uses review-failure guidance without calling the action unsafe", async () => {
+    const app = continuationHarness(() => "idle")
+    ;(app.pending[0] as { resources: string[] }).resources = ["git push origin feature"]
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(app.replies).toHaveLength(1)
+    expect(app.prompts).toHaveLength(1)
+    const continuation = String(app.prompts[0]?.text)
+    expect(continuation).toContain("No safety decision was reached")
+    expect(continuation).toContain("Retry the same action once")
+    expect(continuation).not.toContain("Do not retry the exact blocked action")
+  })
+
   test("resumes an idle session with the denial reason", async () => {
     const app = continuationHarness(() => "idle")
 
@@ -240,5 +279,187 @@ describe("TUI plugin denial continuation", () => {
     const continuation = String((prompts[0]?.prompt as { text?: string } | undefined)?.text)
     expect(prompts[0]).toMatchObject({ sessionID: "ses_root", delivery: "queue", resume: true })
     expect(continuation).toContain("[Auto Permissions] The requested action was blocked:")
+  })
+})
+
+describe("TUI plugin multi-client deduplication", () => {
+  test("steps aside when the V2 server plugin owns permission review", async () => {
+    const subscriptions: string[] = []
+    const app = {
+      options: {},
+      location: { directory: "/repo-a" },
+      client: {
+        session: { generate: async () => ({ text: "{}" }) },
+        plugin: {
+          list: async () => ({
+            data: [{ id: "opencode.auto-permissions.server", state: { status: "active" } }],
+          }),
+        },
+        agent: {
+          list: async () => ({
+            data: [{
+              id: "auto-permissions-reviewer",
+              description: "Hidden, no-tool permission reviewer used by OpenCode Auto Permissions. [auto-permissions:server-review]",
+            }],
+          }),
+        },
+      },
+      data: {
+        on(type: string) {
+          subscriptions.push(type)
+          return () => {}
+        },
+        session: {
+          root: (id: string) => id,
+          get: (id: string) => ({ id }),
+          message: { list: () => [], get: () => undefined, sync: async () => {} },
+          permission: { list: () => [], sync: async () => {} },
+        },
+      },
+      ui: { toast: { show() {} } },
+    } as unknown as Context
+
+    const dispose = await plugin.setup(app)
+
+    expect(subscriptions).toEqual([])
+    expect(dispose).toBeUndefined()
+  })
+
+  test("remains active when the server plugin failed to load", async () => {
+    const subscriptions: string[] = []
+    const app = {
+      options: {},
+      location: { directory: "/repo-a" },
+      client: {
+        session: { generate: async () => ({ text: "{}" }) },
+        plugin: {
+          list: async () => ({
+            data: [{ id: "opencode.auto-permissions.server", state: { status: "failed", error: "boom" } }],
+          }),
+        },
+      },
+      data: {
+        on(type: string) {
+          subscriptions.push(type)
+          return () => {}
+        },
+        session: {
+          root: (id: string) => id,
+          get: (id: string) => ({ id }),
+          message: { list: () => [], get: () => undefined, sync: async () => {} },
+          permission: { list: () => [], sync: async () => {} },
+        },
+      },
+      ui: { toast: { show() {} } },
+    } as unknown as Context
+
+    const dispose = await plugin.setup(app)
+
+    expect(subscriptions).toEqual([
+      "permission.v2.replied",
+      "permission.replied",
+      "permission.v2.asked",
+      "permission.asked",
+    ])
+    dispose?.()
+  })
+
+  test("does not step aside when the server plugin is active but did not install a reviewer", async () => {
+    const subscriptions: string[] = []
+    const app = {
+      options: {},
+      location: { directory: "/repo-a" },
+      client: {
+        session: { generate: async () => ({ text: "{}" }) },
+        plugin: {
+          list: async () => ({
+            data: [{ id: "opencode.auto-permissions.server", state: { status: "active" } }],
+          }),
+        },
+        agent: {
+          list: async () => ({
+            data: [{ id: "auto-permissions-reviewer", description: "Hidden, no-tool permission reviewer." }],
+          }),
+        },
+      },
+      data: {
+        on(type: string) {
+          subscriptions.push(type)
+          return () => {}
+        },
+        session: {
+          root: (id: string) => id,
+          get: (id: string) => ({ id }),
+          message: { list: () => [], get: () => undefined, sync: async () => {} },
+          permission: { list: () => [], sync: async () => {} },
+        },
+      },
+      ui: { toast: { show() {} } },
+    } as unknown as Context
+
+    const dispose = await plugin.setup(app)
+
+    expect(subscriptions).toEqual([
+      "permission.v2.replied",
+      "permission.replied",
+      "permission.v2.asked",
+      "permission.asked",
+    ])
+    dispose?.()
+  })
+
+  test("ignores permission events from another location when running in TUI fallback mode", async () => {
+    const handlers = new Map<string, Set<(event: unknown) => void>>()
+    const replies: unknown[] = []
+    const foreignRequest = {
+      id: "per_other",
+      sessionID: "ses_other",
+      action: "shell",
+      resources: ["sudo rm -rf /"],
+      save: [],
+    }
+    const app = {
+      options: { model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731" },
+      location: { directory: "/repo-a" },
+      client: {
+        session: { generate: async () => ({ text: "{}" }) },
+        plugin: {
+          list: async () => ({ data: [] }),
+        },
+        permission: {
+          reply: async (input: unknown) => replies.push(input),
+        },
+      },
+      data: {
+        on(type: string, handler: (event: unknown) => void) {
+          const set = handlers.get(type) ?? new Set()
+          set.add(handler)
+          handlers.set(type, set)
+          return () => set.delete(handler)
+        },
+        session: {
+          root: (id: string) => id,
+          get: (id: string) => ({ id }),
+          message: { list: () => [], get: () => undefined, sync: async () => {} },
+          permission: { list: () => [foreignRequest], sync: async () => {} },
+        },
+      },
+      ui: { toast: { show() {} } },
+    } as unknown as Context
+
+    const dispose = await plugin.setup(app)
+    try {
+      for (const handler of handlers.get("permission.asked") ?? []) {
+        handler({
+          type: "permission.asked",
+          location: { directory: "/repo-b" },
+          data: foreignRequest,
+        })
+      }
+      await settle()
+      expect(replies).toEqual([])
+    } finally {
+      dispose?.()
+    }
   })
 })
