@@ -48,7 +48,39 @@ describe("OpenCodeClientAdapter", () => {
       agent: "auto-permissions-reviewer",
       model: { providerID: "example", id: "luna-5.6" },
     })
+    expect(calls[0]?.input).not.toHaveProperty("permissions")
     expect(calls[3]?.input).toEqual({ sessionID: "ses_parent", requestID: "per_1", decision: "once" })
+  })
+
+  test("keeps the read tool available for OpenCode free-tier reviewer requests", async () => {
+    const calls: Array<{ method: string; input: any }> = []
+    const adapter = new OpenCodeClientAdapter({
+      session: {
+        create: async (input: any) => {
+          calls.push({ method: "create", input })
+          return { id: "ses_review" }
+        },
+        generate: async (input: any) => {
+          calls.push({ method: "generate", input })
+          return { text: '{"decision":"allow","reasonCode":"safe","reason":"Safe operation."}' }
+        },
+        remove: async (input: any) => calls.push({ method: "remove", input }),
+        interrupt: async () => {},
+      },
+      permission: { list: async () => [], reply: async () => {} },
+    })
+
+    await adapter.generate({
+      prompt: "review",
+      model: { providerID: "opencode", id: "deepseek-v4.1-flash-free" },
+      parentSessionID: "ses_parent",
+      signal: new AbortController().signal,
+    })
+
+    expect(calls[0]?.input.permissions).toEqual([
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "read", resource: expect.stringContaining(".read-disabled-"), effect: "allow" },
+    ])
   })
 
   test("prewarms the reviewer location without invoking a model", async () => {
@@ -292,6 +324,39 @@ describe("OpenCodeClientAdapter", () => {
     })
   })
 
+  test("keeps the read tool available for OpenCode free-tier stable reviewer sessions", async () => {
+    const creates: any[] = []
+    const client = new OpenCodeClientAdapter({
+      postSessionIdPermissionsPermissionId: async () => {},
+      session: {
+        create: async (input: unknown) => {
+          creates.push(input)
+          return { data: { id: "ses_review" } }
+        },
+        prompt: async () => ({
+          data: {
+            info: { structured: { decision: "deny", reasonCode: "x", reason: "Review." } },
+            parts: [],
+          },
+        }),
+        delete: async () => ({ data: true }),
+      },
+    })
+
+    await client.generate({
+      prompt: "review",
+      model: { providerID: "opencode", id: "deepseek-v4.1-flash-free" },
+      parentSessionID: "ses_parent",
+      signal: new AbortController().signal,
+    })
+
+    expect(creates[0]?.body?.permission).toEqual([
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "StructuredOutput", pattern: "*", action: "allow" },
+      { permission: "read", pattern: expect.stringContaining(".read-disabled-"), action: "allow" },
+    ])
+  })
+
   test("uses the generated stable abort envelope when review is cancelled", async () => {
     const calls: unknown[] = []
     const controller = new AbortController()
@@ -460,6 +525,46 @@ describe("OpenCodeClientAdapter", () => {
 
     expect(calls).toEqual([{ path: { id: "ses_1", permissionID: "per_1" }, body: { response: "once" } }])
   })
+
+  test("uses current V2 session.generate and permission.reply even without permission.request.list", async () => {
+    const calls: Array<{ method: string; input: any }> = []
+    const adapter = new OpenCodeClientAdapter({
+      agent: { list: async () => [] },
+      skill: { list: async () => [] },
+      session: {
+        create: async (input: any) => {
+          calls.push({ method: "create", input })
+          return { id: "ses_review" }
+        },
+        generate: async (input: any) => {
+          calls.push({ method: "generate", input })
+          return { text: '{"decision":"allow","reasonCode":"safe","reason":"Safe operation."}' }
+        },
+        remove: async (input: any) => calls.push({ method: "remove", input }),
+        interrupt: async () => {},
+      },
+      permission: {
+        list: async () => [],
+        reply: async (input: any) => calls.push({ method: "reply", input }),
+      },
+    })
+
+    await expect(adapter.generate({
+      prompt: "review",
+      model: { providerID: "example", id: "luna-5.6" },
+      parentSessionID: "ses_parent",
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ decision: "allow", reasonCode: "safe", reason: "Safe operation." })
+    await expect(adapter.reply({
+      sessionID: "ses_parent",
+      requestID: "per_1",
+      reply: "once",
+      protocol: "v2",
+    })).resolves.toBe("replied")
+
+    expect(calls.map((call) => call.method)).toEqual(["create", "generate", "remove", "reply"])
+    expect(calls[3]?.input).toEqual({ sessionID: "ses_parent", requestID: "per_1", decision: "once" })
+  })
 })
 
 describe("parseReviewerJson", () => {
@@ -557,6 +662,30 @@ describe("OpenCodeClientAdapter V2 generate re-ask", () => {
 
     expect(prompts).toHaveLength(2)
     expect(prompts[1]).toContain("Reply with only the JSON object")
+  })
+
+  test("unwraps a data-wrapped re-ask reply like the first reply", async () => {
+    const prompts: string[] = []
+    const replies = ["Sure, I would deny that.", decision]
+    const adapter = new OpenCodeClientAdapter({
+      session: {
+        create: async () => ({ data: { id: "ses_review" } }),
+        generate: async (input: any) => {
+          prompts.push(input.prompt)
+          return { data: { text: replies[prompts.length - 1] } }
+        },
+        remove: async () => {},
+        interrupt: async () => {},
+      },
+    })
+
+    await expect(adapter.generate({
+      prompt: "review",
+      model,
+      parentSessionID: "ses_parent",
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ decision: "deny", reasonCode: "risky", reason: "Risky operation." })
+    expect(prompts).toHaveLength(2)
   })
 
   test("does not re-ask when the first reply parses", async () => {
