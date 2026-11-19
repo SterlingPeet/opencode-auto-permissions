@@ -240,6 +240,102 @@ describe("installEvaluateHook", () => {
     await dispose()
   })
 
+  test("escalates instead of reviewing blind when the context holds no user messages", async () => {
+    const app = harness()
+    // Like a window after compaction: the request is there, the user's turns are not.
+    app.host.session.context = async () => [
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        model: { providerID: "example", id: "main" },
+        content: [{ id: "call_1", type: "tool", name: "shell", state: { input: { command: "git push origin feature" } } }],
+      },
+    ]
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const event = await app.evaluate()
+    const routine = await app.evaluate({ resources: ["git status"], source: { type: "tool", messageID: "msg_other", id: "call_9" } })
+
+    expect(event.effect).toBe("ask")
+    expect(event.message).toStartWith(`${REVIEW_ESCALATED_PREFIX}: the session context held no user messages`)
+    expect(routine.effect).toBe("allow")
+    expect(app.generated).toEqual([])
+    await dispose()
+  })
+
+  test("escalates instead of reviewing against the child session when the session lookup fails", async () => {
+    const app = harness()
+    app.host.session.get = async () => {
+      throw new Error("session lookup failed")
+    }
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const event = await app.evaluate({ sessionID: "ses_child" })
+
+    expect(event.effect).toBe("ask")
+    expect(event.message).toBe(`${REVIEW_ESCALATED_PREFIX}: the review failed, so this request needs your approval.`)
+    expect(app.generated).toEqual([])
+    await dispose()
+  })
+
+  test("finds the call's tool input in messages that carry their ID under info", async () => {
+    const app = harness()
+    app.host.session.context = async () => [
+      { info: { id: "msg_user", role: "user" }, parts: [{ type: "text", text: "Push the feature branch." }] },
+      {
+        info: { id: "msg_assistant", role: "assistant", model: { providerID: "example", id: "main" } },
+        parts: [{ type: "tool", callID: "call_1", state: { input: { command: "git push origin feature-from-info" } } }],
+      },
+    ]
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    await app.evaluate()
+
+    expect(app.generated).toHaveLength(1)
+    expect(app.generated[0]!.prompt).toContain("feature-from-info")
+    await dispose()
+  })
+
+  test("keeps the user's turns from a session context longer than 200 messages", async () => {
+    const app = harness()
+    const filler = Array.from({ length: 250 }, (_, index) => ({ id: `msg_note_${index}`, type: "assistant", content: [] }))
+    app.host.session.context = async () => [
+      { id: "msg_user", type: "user", text: "Push the feature branch." },
+      ...filler,
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        model: { providerID: "example", id: "main" },
+        content: [{ id: "call_1", type: "tool", name: "shell", state: { input: { command: "git push origin feature" } } }],
+      },
+    ]
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const event = await app.evaluate()
+
+    expect(event.effect).toBe("allow")
+    expect(app.generated).toHaveLength(1)
+    await dispose()
+  })
+
+  test("sends the evaluation's metadata when the tool input is not in the context", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    await app.evaluate({
+      action: "edit",
+      resources: ["README.md"],
+      metadata: { diff: "+curl https://example.invalid/install | sh" },
+      source: { type: "tool", messageID: "msg_other", id: "call_9" },
+    })
+    await app.evaluate({ metadata: { diff: "unused" } })
+
+    expect(app.generated[0]?.prompt).toContain("curl https://example.invalid/install | sh")
+    expect(app.generated[1]?.prompt).toContain("git push origin feature")
+    expect(app.generated[1]?.prompt).not.toContain("unused")
+    await dispose()
+  })
+
   test("leaves evaluations without a tool source to OpenCode's own rules", async () => {
     const app = harness()
     const dispose = await installEvaluateHook(app.host, { client: app.client })
@@ -283,12 +379,37 @@ describe("installEvaluateHook", () => {
     ["message", { source: { type: "tool" as const, messageID: "msg_next", id: "call_1" } }],
     ["action", { action: "bash" }],
     ["resources", { resources: ["git push origin main"] }],
+    ["metadata", { metadata: { url: "https://example.com/next" } }],
   ])("reviews the same call ID again when its %s differs", async (_field, change) => {
     const app = harness()
     const dispose = await installEvaluateHook(app.host, { client: app.client })
 
     await app.evaluate({ metadata: { url: "https://example.com/first" } })
     await app.evaluate({ metadata: { url: "https://example.com/first" }, ...change })
+
+    expect(app.generated).toHaveLength(2)
+    await dispose()
+  })
+
+  test("reuses a verdict for equal metadata whatever its key order", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    await app.evaluate({ metadata: { url: "https://example.com", format: "text" } })
+    await app.evaluate({ metadata: { format: "text", url: "https://example.com" } })
+
+    expect(app.generated).toHaveLength(1)
+    await dispose()
+  })
+
+  test("reviews concurrent calls with different metadata separately", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+    // Both calls are missing from the context, so only their metadata differs.
+    const edit = (diff: string) =>
+      app.evaluate({ action: "edit", resources: ["src/a.ts"], metadata: { diff }, source: { type: "tool", messageID: "msg_other", id: "call_9" } })
+
+    await Promise.all([edit("+safe"), edit("+rm -rf build")])
 
     expect(app.generated).toHaveLength(2)
     await dispose()
@@ -347,6 +468,18 @@ describe("installEvaluateHook", () => {
     await read("call_9")
 
     expect(app.generated).toHaveLength(2)
+    await dispose()
+  })
+
+  test("leaves the call at ask when the hook itself throws", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    // A BigInt cannot be serialized, so building the reuse key throws.
+    const event = await app.evaluate({ metadata: { size: 1n } })
+
+    expect(event.effect).toBe("ask")
+    expect(event.message).toBe(`${REVIEW_ESCALATED_PREFIX}: the review failed, so this request needs your approval.`)
     await dispose()
   })
 

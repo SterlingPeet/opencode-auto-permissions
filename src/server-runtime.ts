@@ -13,6 +13,17 @@ export interface ServerSessionInfo {
   location?: { directory?: string; workspaceID?: string }
 }
 
+export interface ServerRuntimeOptions {
+  /**
+   * For the evaluate hook, which can hand a call to the human instead of
+   * judging it on partial context: a failed session lookup throws instead of
+   * treating the session as its own root, messages are matched by `info.id`
+   * as well as `id`, and the session context is kept whole rather than cut to
+   * the last 200 messages, which could drop the user turns the review needs.
+   */
+  failClosed?: boolean
+}
+
 export interface ServerRuntime {
   /** The RuntimeContext the review pipeline reads, without resumeAfterDenial. */
   context: RuntimeContext
@@ -26,7 +37,8 @@ export interface ServerRuntime {
  * pipeline reads, with bounded session, message and permission caches. The
  * server reviewer and the permission evaluate hook both use it.
  */
-export function createServerRuntime(context: any): ServerRuntime {
+export function createServerRuntime(context: any, options: ServerRuntimeOptions = {}): ServerRuntime {
+  const failClosed = options.failClosed === true
   const listeners = new Map<string, Set<(event: unknown) => void>>()
   const sessions = new Map<string, ServerSessionInfo>()
   const messages = new Map<string, unknown[]>()
@@ -51,7 +63,7 @@ export function createServerRuntime(context: any): ServerRuntime {
     let current = sessionID
     while (!seen.has(current)) {
       seen.add(current)
-      const info = await getSession(current).catch(() => undefined)
+      const info = failClosed ? await getSession(current) : await getSession(current).catch(() => undefined)
       if (!info) return sessionID
       if (!info.parentID) return current
       current = info.parentID
@@ -76,10 +88,10 @@ export function createServerRuntime(context: any): ServerRuntime {
         message: {
           list: (sessionID) => messages.get(sessionID) ?? [],
           get: (sessionID, messageID) =>
-            (messages.get(sessionID) ?? []).find((message) => isRecord(message) && message.id === messageID),
+            (messages.get(sessionID) ?? []).find((message) => isRecord(message) && messageIdOf(message, failClosed) === messageID),
           sync: async (sessionID) => {
             const list = unwrapServerData(await context.session.context({ sessionID }))
-            const bounded = Array.isArray(list) ? list.slice(-MAX_MESSAGES_PER_SESSION) : []
+            const bounded = Array.isArray(list) ? (failClosed ? [...list] : list.slice(-MAX_MESSAGES_PER_SESSION)) : []
             setBounded(messages, sessionID, bounded, MAX_MESSAGE_CACHE)
           },
         },
@@ -122,6 +134,10 @@ export function unwrapServerData(result: unknown): unknown {
     value = value.data
   }
   return value
+}
+
+function messageIdOf(message: Record<string, any>, includeInfo: boolean): unknown {
+  return includeInfo && isRecord(message.info) ? message.info.id : message.id
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

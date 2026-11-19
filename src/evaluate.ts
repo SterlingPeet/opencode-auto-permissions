@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { parseConfig, type Config } from "./config.ts"
 import { REVIEW_ESCALATED_PREFIX } from "./context.ts"
@@ -6,6 +7,7 @@ import { JSON_ONLY_INSTRUCTION, OpenCodeClientAdapter, parseReviewerJson } from 
 import {
   decide,
   denialMessage,
+  MissingUserContextError,
   writeDecision,
   writeFailure,
   writeReceived,
@@ -82,8 +84,15 @@ export async function installEvaluateHook(
   const config = parseConfig(host.options)
   if (!config.serverReview || config.shadow) return async () => {}
   const client = overrides.client ?? new ServerReviewerClient(host, config)
-  const runtime = createServerRuntime(host)
-  const state: ReviewState = { sharedReviews: new Map(), sessionApprovals: new Set(), releaseUnwatchedReviews: true }
+  // Fail closed, because the hook can escalate to the human instead of
+  // reviewing on a missing session or a truncated context.
+  const runtime = createServerRuntime(host, { failClosed: true })
+  const state: ReviewState = {
+    sharedReviews: new Map(),
+    sessionApprovals: new Set(),
+    releaseUnwatchedReviews: true,
+    requireUserMessages: true,
+  }
   const disposed = new AbortController()
   const verdicts = new Map<string, Verdict>()
   const expiries = new Set<ReturnType<typeof setTimeout>>()
@@ -150,6 +159,9 @@ async function review(
     // reusable session approval here; it settles this one call.
     always: [],
     source: { type: "tool", messageID: event.source.messageID, callID: event.source.id },
+    // The reviewer falls back to it when the call's tool input is not in the
+    // session context, such as a call whose message is outside the window.
+    ...(event.metadata ? { metadata: { ...event.metadata } } : {}),
     protocol: "v2",
   }
   const logged: LoggedRequest = { ...request, protocol: "evaluate" }
@@ -190,15 +202,29 @@ function apply(event: PermissionEvaluation, verdict: Verdict): void {
 }
 
 function escalation(error: unknown): Verdict {
-  const cause = failureCategory(error) === "timeout" ? "the review timed out" : "the review failed"
+  const cause = error instanceof MissingUserContextError
+    ? "the session context held no user messages to review it against"
+    : failureCategory(error) === "timeout"
+      ? "the review timed out"
+      : "the review failed"
   return {
     effect: "ask",
     message: `${REVIEW_ESCALATED_PREFIX}: ${cause}, so this request needs your approval.`,
   }
 }
 
+// Nested Code Mode calls arrive with their parent's call ID, so the metadata
+// (the nested call's arguments) tells them apart.
 function callKey(event: SourcedEvaluation): string {
-  return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources])
+  const metadata = createHash("sha256").update(stableJson(event.metadata ?? null)).digest("hex")
+  return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources, metadata])
+}
+
+/** JSON with object keys sorted, so equal metadata always hashes the same. */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    isRecord(item) ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => (left < right ? -1 : 1))) : item,
+  )
 }
 
 function stopError(deadline: AbortSignal): Error {
