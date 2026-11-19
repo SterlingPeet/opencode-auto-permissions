@@ -240,12 +240,25 @@ describe("installEvaluateHook", () => {
     await dispose()
   })
 
+  test("leaves evaluations without a tool source to OpenCode's own rules", async () => {
+    const app = harness()
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    // Like an automation run's assertNotDenied probe.
+    const event = await app.evaluate({ action: "execute", resources: ["*"], source: null })
+
+    expect(event.effect).toBe("ask")
+    expect(event.message).toBeUndefined()
+    expect(app.generated).toEqual([])
+    await dispose()
+  })
+
   test("settles routine commands by policy without a model review", async () => {
     const app = harness()
     const dispose = await installEvaluateHook(app.host, { client: app.client })
 
-    // No source, so the policy reads the command from the resources.
-    const event = await app.evaluate({ resources: ["git status"], source: null })
+    // A call missing from the context, so the policy reads the command from the resources.
+    const event = await app.evaluate({ resources: ["git status"], source: { type: "tool", messageID: "msg_other", id: "call_9" } })
 
     expect(event.effect).toBe("allow")
     expect(app.generated).toEqual([])

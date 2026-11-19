@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto"
 import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { parseConfig, type Config } from "./config.ts"
 import { REVIEW_ESCALATED_PREFIX } from "./context.ts"
@@ -45,6 +44,12 @@ export interface EvaluateHost {
   readonly generate: {
     text(input: { prompt: string; model?: ReviewModel }, options?: { signal?: AbortSignal }): Promise<{ text: string }>
   }
+}
+
+type SourcedEvaluation = PermissionEvaluation & { readonly source: NonNullable<PermissionEvaluation["source"]> }
+
+function hasSource(event: PermissionEvaluation): event is SourcedEvaluation {
+  return event.source !== undefined
 }
 
 type Verdict = { effect: PermissionEvaluation["effect"]; message?: string }
@@ -97,13 +102,18 @@ export async function installEvaluateHook(
     // The hook must never throw: OpenCode awaits it inside the permission
     // check, and a rejection there would fail the tool call outright.
     try {
-      if (event.effect !== "ask" || event.agent === REVIEWER_AGENT_ID) return
+      // An evaluation without a tool source is an OpenCode probe made outside
+      // a tool call, such as an automation run's assertNotDenied checks.
+      // OpenCode settles those with its own rules and, for a run, its
+      // Unattended ruleset, which it applies after this hook and only to an
+      // evaluation left at ask, so a verdict here would replace that ruleset.
+      if (event.effect !== "ask" || !hasSource(event) || event.agent === REVIEWER_AGENT_ID) return
       const key = callKey(event)
-      const reused = key ? verdicts.get(key) : undefined
+      const reused = verdicts.get(key)
       const verdict = reused ?? (await review(runtime.context, client, config, state, event, disposed.signal))
       // An escalation is not reused, so a later evaluation of the call gets a
       // fresh review instead of a failure that may have been transient.
-      if (key && !reused && verdict.effect !== "ask") remember(key, verdict)
+      if (!reused && verdict.effect !== "ask") remember(key, verdict)
       apply(event, verdict)
     } catch (error) {
       apply(event, escalation(error))
@@ -127,19 +137,19 @@ async function review(
   client: ReviewerClient,
   config: Config,
   state: ReviewState,
-  event: PermissionEvaluation,
+  event: SourcedEvaluation,
   disposedSignal: AbortSignal,
 ): Promise<Verdict> {
   const request: PermissionRequest = {
     // The hook runs before a request exists, so the tool call ID stands in.
-    id: event.source?.id ?? `evaluate_${randomUUID()}`,
+    id: event.source.id,
     sessionID: event.sessionID,
     action: event.action,
     resources: [...event.resources],
     // The hook receives no `save` patterns, so allow_session cannot become a
     // reusable session approval here; it settles this one call.
     always: [],
-    ...(event.source ? { source: { type: "tool", messageID: event.source.messageID, callID: event.source.id } } : {}),
+    source: { type: "tool", messageID: event.source.messageID, callID: event.source.id },
     protocol: "v2",
   }
   const logged: LoggedRequest = { ...request, protocol: "evaluate" }
@@ -187,8 +197,7 @@ function escalation(error: unknown): Verdict {
   }
 }
 
-function callKey(event: PermissionEvaluation): string | undefined {
-  if (!event.source) return undefined
+function callKey(event: SourcedEvaluation): string {
   return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources])
 }
 
