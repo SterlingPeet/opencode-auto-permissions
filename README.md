@@ -83,7 +83,7 @@ For each supported permission request, Auto Permissions combines deterministic s
 - External-directory boundaries are not treated as sensitive by default: ordinary project, tool, cache, log, state, temporary, and worktree paths are approved unless the target or operation presents a concrete hazard.
 - Broad boundary globs such as `/tmp/*` are not treated as the requested scope when the tool input identifies a precise target; the reviewer evaluates the actual operation and latest user request.
 - The reviewer is tuned for unattended agents: it defaults to approval when an action reasonably serves the task and uses `ask` only as a last resort.
-- If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. If no fallback is available or both attempts fail, the request is rejected automatically and the main agent receives guidance to continue with a narrower or lower-risk step. On the V2 path, which has no structured output, a reply that is not JSON is re-asked once from the same model with a stricter instruction before that failure counts.
+- If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. If no fallback is available or both attempts fail, the request is rejected automatically and the main agent receives guidance to continue with a narrower or lower-risk step; with `serverReview`, it is left to you instead (see Server Review). On the V2 path, which has no structured output, a reply that is not JSON is re-asked once from the same model with a stricter instruction before that failure counts.
 - Reviewer sessions are hidden, have no tools, and deny all permissions.
 - Only a small, recent window of relevant user context is sent for review.
 - Plugin-authored denial continuations are excluded from that context so an earlier verdict cannot become a self-reinforcing human instruction.
@@ -92,7 +92,7 @@ The reviewer never receives authority to execute the requested action. It always
 
 Reviewer sessions are standalone and deleted after each decision or failure. Startup never deletes reviewer sessions because multiple OpenCode processes may be reviewing permissions concurrently; one process must not delete another process's active review.
 
-Auto Permissions never asks the user to resolve a permission prompt. When the reviewer cannot safely approve, it denies and tells the coding agent why, what safer alternative to try, and to continue autonomously where possible.
+Outside `serverReview`, Auto Permissions never asks the user to resolve a permission prompt. When the reviewer cannot safely approve, it denies and tells the coding agent why, what safer alternative to try, and to continue autonomously where possible.
 
 Denial and failure continuations preserve the main session's selected agent, model, and variant. A permission decision does not reset the primary agent's reasoning effort.
 
@@ -108,7 +108,7 @@ When an action is rejected, Auto Permissions returns the reason to the main agen
 
 By default the TUI reviews a request after OpenCode has published it, so terminal tab markers and agent-status notifiers alert on every `ask`, including the ones the reviewer approves a second later. Set `serverReview: true` in the `opencode.json` entry to review in the server plugin's permission `evaluate` hook instead, which runs before OpenCode creates the request: an approved call runs and a denied one returns the reason to the agent, and neither is ever published as `permission.asked`.
 
-If the review fails or exceeds `timeoutMs` (one budget for the whole hook, since the agent's turn waits on it), the hook leaves the request at `ask` with a message saying the automatic review was unavailable, and you get OpenCode's normal prompt; the TUI reviewer recognizes that message and does not review the request again. Unattended sessions deny such a request, as OpenCode does for any unanswered `ask`. The hook does not run in `shadow` mode, and it settles each call once, so `allow_session` approves only that call. Load the plugin globally: OpenCode runs a hook only for sessions in its plugin's location.
+If the review fails or exceeds `timeoutMs` (one budget for the whole hook, including any fallback attempt, since the agent's turn waits on it), the hook leaves the request at `ask` with a message saying the automatic review was unavailable, and you get OpenCode's normal prompt; the TUI reviewer recognizes that message and does not review the request again. It does the same when a model review would have no user messages to judge against, which can happen after compaction, because the reviewer defaults to approval. In an automation run, where nobody can answer, OpenCode then settles a request left at `ask` with the run's unattended rules: it allows what those rules allow and denies the rest. Evaluations without a tool call, such as OpenCode's own `assertNotDenied` and `allows` probes in automation runs, are left to OpenCode's rules unreviewed. The hook does not run in `shadow` mode, and it settles each call once, so `allow_session` approves only that call. Load the plugin globally: OpenCode runs a hook only for sessions in its plugin's location.
 
 ## Choosing Rules
 
@@ -133,7 +133,7 @@ The plugin tuple accepts these options:
 | `model` | Requesting session model | Optional dedicated reviewer model in `provider/model` form. |
 | `variant` | Selected model's default | Optional reviewer-only model variant. Use `"low"` when supported for faster decisions. |
 | `sessionApprovals` | `true` | Reuse guarded, pattern-specific approvals immediately for the current session. Set `false` for one-time approvals only. |
-| `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). |
+| `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). With `serverReview`, it is also the budget for the whole hook, so a fallback runs only in the time the first attempt leaves. |
 | `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
 | `serverReview` | `false` | OpenCode 2 only. Review in the server's permission `evaluate` hook so approved and denied calls are never published as permission requests; a failed review falls back to the normal prompt. See Server Review. |
