@@ -2,6 +2,7 @@ import { OpenCodeClientAdapter } from "./opencode-client.ts"
 import { parseConfig, type Config } from "./config.ts"
 import {
   collectReviewInput,
+  escalatedByEvaluateHook,
   isRequestPending,
   normalizeAskedEvent,
   normalizeRepliedEvent,
@@ -54,6 +55,8 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     const asked = normalizeAskedEvent(event)
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return
+    // The server hook already reviewed it and chose to ask the human.
+    if (escalatedByEvaluateHook(asked)) return
 
     const controller = new AbortController()
     const startedAt = performance.now()
@@ -75,6 +78,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
       : normalized
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return
+    if (escalatedByEvaluateHook(asked)) return
     const controller = new AbortController()
     const startedAt = performance.now()
     writeReceived(config, asked)

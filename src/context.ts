@@ -44,6 +44,7 @@ export function normalizeAskedEvent(event: unknown): PermissionRequest | null {
       // older betas and stable events still use "always".
       always: stringArray(data.always ?? data.save),
       ...(normalizeTool(data.source) ? { source: normalizeTool(data.source)! } : {}),
+      ...(typeof data.message === "string" ? { message: data.message } : {}),
       protocol: "v2",
     }
   }
@@ -234,6 +235,11 @@ function userText(message: unknown): string | undefined {
     .map((part) => part.text)
     .join("\n")
   return text && !isPluginContinuation(text) ? text : undefined
+}
+
+/** True when the server evaluate hook already tried to review this request. */
+export function escalatedByEvaluateHook(request: PermissionRequest): boolean {
+  return request.message?.startsWith(REVIEW_ESCALATED_PREFIX) ?? false
 }
 
 function isPluginContinuation(text: string): boolean {

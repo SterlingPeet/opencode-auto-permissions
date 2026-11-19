@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { REVIEW_ESCALATED_PREFIX } from "../src/context.ts"
 import { installReviewer } from "../src/reviewer.ts"
 import type { PermissionRequest, ReviewerClient, RuntimeContext } from "../src/types.ts"
 
@@ -599,6 +600,49 @@ describe("installReviewer", () => {
     expect(app.replies).toEqual([
       { sessionID: "ses_root", requestID: "per_1", reply: "once", protocol: "v2" },
     ])
+    dispose()
+  })
+
+  test.each(["permission.v2.asked", "permission.asked"])(
+    "leaves a %s request the server evaluate hook escalated to the human",
+    async (type) => {
+      const app = harness()
+      let reviews = 0
+      app.client.generate = async () => {
+        reviews++
+        return { decision: "allow", reasonCode: "requested_action", reason: "The user requested this action." }
+      }
+      const pending = {
+        ...request("git push origin feature"),
+        message: `${REVIEW_ESCALATED_PREFIX}: the review timed out, so this request needs your approval.`,
+      }
+      app.requests.push(pending)
+      const dispose = installReviewer(app.context, { client: app.client, protocols: ["v2"] })
+
+      app.emit(type, pending)
+      await settle()
+
+      expect(reviews).toBe(0)
+      expect(app.replies).toEqual([])
+      dispose()
+    },
+  )
+
+  test("still reviews a request whose message did not come from the evaluate hook", async () => {
+    const app = harness()
+    app.client.generate = async () => ({
+      decision: "allow",
+      reasonCode: "requested_action",
+      reason: "The user requested this action.",
+    })
+    const pending = { ...request("git push origin feature"), message: "Another plugin's note." }
+    app.requests.push(pending)
+    const dispose = installReviewer(app.context, { client: app.client })
+
+    app.emit("permission.v2.asked", pending)
+    await settle()
+
+    expect(app.replies.map((reply) => reply.reply)).toEqual(["once"])
     dispose()
   })
 })
