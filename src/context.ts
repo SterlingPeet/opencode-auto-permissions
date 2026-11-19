@@ -22,6 +22,11 @@ export function sameLocation(
   return left.directory === right.directory && (left.workspaceID ?? undefined) === (right.workspaceID ?? undefined)
 }
 
+// Starts the message the server evaluate hook puts on a request it could not
+// review. OpenCode copies that message onto the published request, so the TUI
+// reviewer can recognize it and leave the request to the human.
+export const REVIEW_ESCALATED_PREFIX = "[Auto Permissions] Automatic review unavailable"
+
 export function normalizeAskedEvent(event: unknown): PermissionRequest | null {
   if (!isRecord(event)) return null
   const data = payload(event)

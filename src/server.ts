@@ -4,15 +4,13 @@ import { parseConfig } from "./config.ts"
 import { denialContinuation, sameLocation, SERVER_PLUGIN_ID } from "./context.ts"
 import { describeError, writeDiagnostic } from "./diagnostics.ts"
 import { REVIEWER_DIRECTORY } from "./opencode-client.ts"
+import { installEvaluateHook } from "./evaluate.ts"
 import { installReviewer } from "./reviewer.ts"
 import { createStableRuntime, protocolForVersion } from "./stable.ts"
-import type { PermissionRequest, RuntimeContext } from "./types.ts"
+import { createServerRuntime } from "./server-runtime.ts"
+import type { RuntimeContext } from "./types.ts"
 
 const REVIEWER_DESCRIPTION = "Hidden, no-tool permission reviewer used by OpenCode Auto Permissions."
-const MAX_SESSION_CACHE = 256
-const MAX_MESSAGE_CACHE = 32
-const MAX_PERMISSION_CACHE = 64
-const MAX_MESSAGES_PER_SESSION = 200
 
 const v2Plugin = V2Plugin.define({
   id: SERVER_PLUGIN_ID,
@@ -31,23 +29,31 @@ const v2Plugin = V2Plugin.define({
     })
     if (config.runtime === "stable") return
     if (context.location?.directory === REVIEWER_DIRECTORY) return
-    if (!supportsServerV2Review(context)) return
-    const cleanup = installServerV2Reviewer(context, config.diagnosticsPath)
-    if (!cleanup) return
+    // The evaluate hook needs none of the event stream the server reviewer
+    // subscribes to, so it installs whether or not that reviewer can.
+    const stopServerReviewer = supportsServerV2Review(context)
+      ? installServerV2Reviewer(context, config.diagnosticsPath)
+      : undefined
     try {
-      // Advertise that this location has an active server reviewer. The TUI
-      // fallback checks this marker instead of assuming plugin presence means
-      // the server installed a reviewer.
-      await context.agent.transform((draft) => {
-        draft.update(REVIEWER_AGENT_ID, (agent) => {
-          agent.description = `${REVIEWER_DESCRIPTION} ${SERVER_REVIEW_MARKER}`
+      if (stopServerReviewer) {
+        // Advertise that this location has an active server reviewer. The TUI
+        // fallback checks this marker instead of assuming plugin presence means
+        // the server installed a reviewer.
+        await context.agent.transform((draft) => {
+          draft.update(REVIEWER_AGENT_ID, (agent) => {
+            agent.description = `${REVIEWER_DESCRIPTION} ${SERVER_REVIEW_MARKER}`
+          })
         })
-      })
+      }
+      const stopEvaluateHook = await installEvaluateHook(context)
+      return async () => {
+        stopServerReviewer?.()
+        await stopEvaluateHook()
+      }
     } catch (error) {
-      cleanup()
+      stopServerReviewer?.()
       throw error
     }
-    return cleanup
   },
 })
 
@@ -66,73 +72,12 @@ function supportsServerV2Review(context: unknown): boolean {
 }
 
 function installServerV2Reviewer(context: any, diagnosticsPath: string | undefined): () => void {
-  const listeners = new Map<string, Set<(event: unknown) => void>>()
-  const sessions = new Map<string, { id: string; parentID?: string; location?: { directory?: string; workspaceID?: string } }>()
-  const messages = new Map<string, unknown[]>()
-  const permissions = new Map<string, PermissionRequest[]>()
+  const runtime = createServerRuntime(context)
+  const { listeners, getSession } = runtime
   const abortController = new AbortController()
 
-  const getSession = async (sessionID: string) => {
-    const cached = sessions.get(sessionID)
-    if (cached) return cached
-    const fetched = unwrapServerData(await context.session.get({ sessionID }))
-    if (!isRecord(fetched) || typeof fetched.id !== "string") return undefined
-    const info = {
-      id: fetched.id,
-      ...(typeof fetched.parentID === "string" ? { parentID: fetched.parentID } : {}),
-      ...(isRecord(fetched.location) ? { location: fetched.location } : {}),
-    }
-    setBounded(sessions, sessionID, info, MAX_SESSION_CACHE)
-    return info
-  }
-
-  const root = async (sessionID: string): Promise<string> => {
-    const seen = new Set<string>()
-    let current = sessionID
-    while (!seen.has(current)) {
-      seen.add(current)
-      const info = await getSession(current).catch(() => undefined)
-      if (!info) return sessionID
-      if (!info.parentID) return current
-      current = info.parentID
-    }
-    return sessionID
-  }
-
   const runtimeContext: RuntimeContext = {
-    options: context.options,
-    client: context,
-    location: context.location,
-    data: {
-      on(type, handler) {
-        const set = listeners.get(type) ?? new Set<(event: unknown) => void>()
-        set.add(handler)
-        listeners.set(type, set)
-        return () => set.delete(handler)
-      },
-      session: {
-        root,
-        get: (sessionID) => sessions.get(sessionID),
-        message: {
-          list: (sessionID) => messages.get(sessionID) ?? [],
-          get: (sessionID, messageID) =>
-            (messages.get(sessionID) ?? []).find((message) => isRecord(message) && message.id === messageID),
-          sync: async (sessionID) => {
-            const list = unwrapServerData(await context.session.context({ sessionID }))
-            const bounded = Array.isArray(list) ? list.slice(-MAX_MESSAGES_PER_SESSION) : []
-            setBounded(messages, sessionID, bounded, MAX_MESSAGE_CACHE)
-          },
-        },
-        permission: {
-          list: (sessionID) => permissions.get(sessionID),
-          sync: async (sessionID) => {
-            const list = unwrapServerData(await context.permission.list({ sessionID }))
-            setBounded(permissions, sessionID, Array.isArray(list) ? list : [], MAX_PERMISSION_CACHE)
-          },
-        },
-      },
-      location: { default: () => context.location ?? {} },
-    },
+    ...runtime.context,
     resumeAfterDenial(sessionID, reason, kind) {
       if (typeof context.session?.prompt !== "function") return
       void (async () => {
@@ -210,27 +155,8 @@ function installServerV2Reviewer(context: any, diagnosticsPath: string | undefin
   return () => {
     abortController.abort("plugin disposed")
     stopReviewer()
-    listeners.clear()
-    sessions.clear()
-    messages.clear()
-    permissions.clear()
+    runtime.clear()
   }
-}
-
-function setBounded<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
-  if (!map.has(key) && map.size >= limit) {
-    const oldest = map.keys().next().value
-    if (oldest !== undefined) map.delete(oldest)
-  }
-  map.set(key, value)
-}
-
-function unwrapServerData(result: unknown): unknown {
-  let value = result
-  for (let depth = 0; depth < 3 && isRecord(value) && "data" in value; depth++) {
-    value = value.data
-  }
-  return value
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

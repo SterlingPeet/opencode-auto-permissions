@@ -20,6 +20,7 @@ export interface Config {
   userMessageCount: number
   shadow: boolean
   sessionApprovals: boolean
+  serverReview: boolean
   runtime: "auto" | "stable" | "v2"
   diagnosticsPath: string | undefined
   structuredEndpoint: StructuredEndpoint | undefined
@@ -44,6 +45,7 @@ export function parseConfig(options: Readonly<Record<string, unknown>>): Config 
     ),
     shadow: options.shadow === true,
     sessionApprovals: options.sessionApprovals !== false,
+    serverReview: options.serverReview === true,
     runtime: parseRuntime(options.runtime),
     diagnosticsPath: parseDiagnosticsPath(options.debug),
     structuredEndpoint: parseStructuredEndpoint(options.structuredEndpoint),

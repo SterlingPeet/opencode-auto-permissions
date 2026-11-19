@@ -477,4 +477,59 @@ describe("server plugin", () => {
     expect(subscribed).toBeFalse()
     expect(cleanup).toBeUndefined()
   })
+
+  function evaluateHookContext(hook: (name: string, callback: unknown) => Promise<{ dispose: () => Promise<void> }>) {
+    const state = { subscriptionSignal: undefined as AbortSignal | undefined }
+    const context: any = {
+      options: { serverReview: true },
+      location: { directory: "/repo" },
+      agent: { transform: async (fn: (draft: any) => void) => fn({ update: () => {} }) },
+      event: {
+        subscribe(options?: { signal?: AbortSignal }) {
+          state.subscriptionSignal = options?.signal
+          return {
+            [Symbol.asyncIterator]: () => ({
+              next: () =>
+                new Promise((resolve) => {
+                  const done = () => resolve({ done: true, value: undefined })
+                  if (options?.signal?.aborted) done()
+                  else options?.signal?.addEventListener("abort", done, { once: true })
+                }),
+            }),
+          }
+        },
+      },
+      permission: { list: async () => [], reply: async () => {}, hook },
+      session: {
+        get: async () => ({ id: "ses_1" }),
+        context: async () => [],
+        create: async () => ({ id: "ses_r" }),
+        generate: async () => ({ text: "{}" }),
+        remove: async () => {},
+      },
+      generate: { text: async () => ({ text: "{}" }) },
+    }
+    return { context, state }
+  }
+
+  test("stops both the server reviewer and the evaluate hook on cleanup", async () => {
+    let hookDisposed = false
+    const { context, state } = evaluateHookContext(async () => ({ dispose: async () => void (hookDisposed = true) }))
+
+    const cleanup = await server.setup(context)
+    expect(state.subscriptionSignal?.aborted).toBeFalse()
+    await cleanup?.()
+
+    expect(state.subscriptionSignal?.aborted).toBeTrue()
+    expect(hookDisposed).toBeTrue()
+  })
+
+  test("stops the server reviewer when the evaluate hook fails to install", async () => {
+    const { context, state } = evaluateHookContext(async () => {
+      throw new Error("hook unavailable")
+    })
+
+    await expect(server.setup(context)).rejects.toThrow("hook unavailable")
+    expect(state.subscriptionSignal?.aborted).toBeTrue()
+  })
 })

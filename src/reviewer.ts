@@ -103,8 +103,22 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
 }
 
 export interface ReviewState {
-  sharedReviews: Map<string, Promise<Decision>>
+  sharedReviews: Map<string, SharedReview>
   sessionApprovals: Set<string>
+  /**
+   * Server evaluate hook only. Each caller stops waiting at its own deadline,
+   * and the shared model review is aborted once every caller has stopped,
+   * because a review bound to the first caller's deadline would fail later
+   * callers that still have budget. The TUI keeps a shared review running
+   * until it settles or the plugin is disposed.
+   */
+  releaseUnwatchedReviews?: boolean
+}
+
+export interface SharedReview {
+  decision: Promise<Decision>
+  controller: AbortController
+  waiters: number
 }
 
 export type DecisionSource = "policy" | "model" | "session"
@@ -146,19 +160,53 @@ export async function decide(
   const reviewKey = concurrentReviewKey(request, input)
   let shared = state.sharedReviews.get(reviewKey)
   if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context, client, config, input, reviewSignal)
-    state.sharedReviews.set(reviewKey, shared)
-    void shared.finally(() => {
-      if (state.sharedReviews.get(reviewKey) === shared) state.sharedReviews.delete(reviewKey)
+    const controller = new AbortController()
+    const review: SharedReview = {
+      decision: modelDecision(context, client, config, input, AbortSignal.any([reviewSignal, controller.signal])),
+      controller,
+      waiters: 0,
+    }
+    shared = review
+    state.sharedReviews.set(reviewKey, review)
+    void review.decision.finally(() => {
+      if (state.sharedReviews.get(reviewKey) === review) state.sharedReviews.delete(reviewKey)
     }).catch(() => undefined)
   }
-  const decision = policyDecision ?? cachedDecision ?? (await shared!)
-  if (parentSignal.aborted) return undefined
+  const decision = policyDecision ?? cachedDecision ?? (await waitForReview(state, reviewKey, shared!, parentSignal))
+  if (!decision || parentSignal.aborted) return undefined
 
   if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
     state.sessionApprovals.add(approvalKey)
   }
   return { decision, source: decisionSource(policyDecision, cachedDecision), input }
+}
+
+/** Waits for a shared review; see ReviewState.releaseUnwatchedReviews. */
+async function waitForReview(
+  state: ReviewState,
+  reviewKey: string,
+  shared: SharedReview,
+  parentSignal: AbortSignal,
+): Promise<Decision | undefined> {
+  if (!state.releaseUnwatchedReviews) return shared.decision
+  shared.waiters++
+  let onAbort = () => {}
+  const stopped = new Promise<undefined>((resolve) => {
+    onAbort = () => resolve(undefined)
+    if (parentSignal.aborted) onAbort()
+    else parentSignal.addEventListener("abort", onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([shared.decision, stopped])
+  } finally {
+    parentSignal.removeEventListener("abort", onAbort)
+    if (--shared.waiters === 0) {
+      // Drop it first so a later identical call starts a fresh review instead
+      // of joining one that is being aborted.
+      if (state.sharedReviews.get(reviewKey) === shared) state.sharedReviews.delete(reviewKey)
+      shared.controller.abort("no caller is waiting for this review")
+    }
+  }
 }
 
 export function denialMessage(reason: string): string {

@@ -17,6 +17,8 @@ export const REVIEWER_DIRECTORY = join(tmpdir(), "opencode-auto-permissions", "r
 // every real read remains denied. The random path is never created.
 const REVIEWER_READ_DISABLED = join(REVIEWER_DIRECTORY, `.read-disabled-${randomUUID()}`, "*")
 const REVIEWER_SESSION_TITLE = "Auto Permissions review"
+// For text-only generation paths that have no structured-output option.
+export const JSON_ONLY_INSTRUCTION = `Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
 
 type LegacyPermissionRule = {
   permission: string
@@ -314,7 +316,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       }, { signal: input.signal }))
       if (!isRecord(session) || typeof session.id !== "string") throw new Error("OpenCode failed to create a reviewer session")
       sessionID = session.id
-      const strictPrompt = `${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
+      const strictPrompt = `${input.prompt}\n\n${JSON_ONLY_INSTRUCTION}`
       const result = unwrapData(await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal }))
       if (!isRecord(result) || typeof result.text !== "string") throw new Error("OpenCode reviewer returned no text output")
       try {
