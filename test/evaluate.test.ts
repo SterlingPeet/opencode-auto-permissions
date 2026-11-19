@@ -126,6 +126,21 @@ describe("installEvaluateHook", () => {
     await dispose()
   })
 
+  test("bounds a stalled context lookup by the same deadline", async () => {
+    const app = harness({ timeoutMs: 100 })
+    app.host.session.context = () => new Promise(() => {})
+    const dispose = await installEvaluateHook(app.host, { client: app.client })
+
+    const startedAt = performance.now()
+    const event = await app.evaluate()
+
+    expect(performance.now() - startedAt).toBeLessThan(1_000)
+    expect(event.effect).toBe("ask")
+    expect(event.message).toStartWith(`${REVIEW_ESCALATED_PREFIX}: the review timed out`)
+    expect(app.generated).toEqual([])
+    await dispose()
+  })
+
   test.each(["reviewer", "session context"])("leaves the evaluation at ask when the %s throws", async (failing) => {
     const app = harness()
     if (failing === "reviewer") app.client.generate = async () => { throw new Error("provider unavailable") }
