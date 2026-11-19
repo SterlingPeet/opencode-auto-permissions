@@ -83,15 +83,17 @@ export async function collectReviewInput(
     .slice(-userMessageCount)
   const currentDirectory = directory(context)
   const model = latestUserModel(sessionMessages) ?? latestUserModel(rootMessages)
+  const toolInput = request.source?.type === "tool"
+    ? findToolInput(context, request.sessionID, request.source.messageID, request.source.callID)
+    : undefined
 
   return {
     request: {
       action: request.action,
       resources: [...request.resources],
       sessionPatterns: [...request.always],
-      ...(request.source?.type === "tool"
-        ? { toolInput: findToolInput(context, request.sessionID, request.source.messageID, request.source.callID) }
-        : {}),
+      ...(request.source?.type === "tool" ? { toolInput } : {}),
+      ...(toolInput === undefined && request.metadata ? { metadata: request.metadata } : {}),
     },
     context: {
       rootSessionID,

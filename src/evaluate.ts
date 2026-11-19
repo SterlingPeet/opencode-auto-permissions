@@ -6,6 +6,7 @@ import { JSON_ONLY_INSTRUCTION, OpenCodeClientAdapter, parseReviewerJson } from 
 import {
   decide,
   denialMessage,
+  MissingUserContextError,
   writeDecision,
   writeFailure,
   writeReceived,
@@ -74,7 +75,12 @@ export async function installEvaluateHook(
   const config = parseConfig(host.options)
   if (!config.serverReview || config.shadow) return async () => {}
   const client = overrides.client ?? new ServerReviewerClient(host, config)
-  const state: ReviewState = { sharedReviews: new Map(), sessionApprovals: new Set(), releaseUnwatchedReviews: true }
+  const state: ReviewState = {
+    sharedReviews: new Map(),
+    sessionApprovals: new Set(),
+    releaseUnwatchedReviews: true,
+    requireUserMessages: true,
+  }
   const disposed = new AbortController()
   const verdicts = new Map<string, Verdict>()
   const expiries = new Set<ReturnType<typeof setTimeout>>()
@@ -138,6 +144,9 @@ async function review(
     // reusable session approval here; it settles this one call.
     always: [],
     source: { type: "tool", messageID: event.source.messageID, callID: event.source.id },
+    // The reviewer falls back to it when the call's tool input is not in the
+    // session context, such as a call whose message is outside the window.
+    ...(event.metadata ? { metadata: { ...event.metadata } } : {}),
     protocol: "v2",
   }
   const logged: LoggedRequest = { ...request, protocol: "evaluate" }
@@ -178,7 +187,11 @@ function apply(event: PermissionEvaluation, verdict: Verdict): void {
 }
 
 function escalation(error: unknown): Verdict {
-  const cause = failureCategory(error) === "timeout" ? "the review timed out" : "the review failed"
+  const cause = error instanceof MissingUserContextError
+    ? "the session context held no user messages to review it against"
+    : failureCategory(error) === "timeout"
+      ? "the review timed out"
+      : "the review failed"
   return {
     effect: "ask",
     message: `${REVIEW_ESCALATED_PREFIX}: ${cause}, so this request needs your approval.`,

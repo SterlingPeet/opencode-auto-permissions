@@ -117,6 +117,12 @@ export interface ReviewState {
    * until it settles or the plugin is disposed.
    */
   releaseUnwatchedReviews?: boolean
+  /**
+   * Server evaluate hook only. A model review with no user messages throws
+   * MissingUserContextError instead of judging the call blind, because the
+   * reviewer defaults to approval and the hook can escalate to the human.
+   */
+  requireUserMessages?: boolean
 }
 
 export interface SharedReview {
@@ -131,6 +137,13 @@ export interface ReviewOutcome {
   decision: Decision
   source: DecisionSource
   input: ReviewInput
+}
+
+export class MissingUserContextError extends Error {
+  constructor() {
+    super("Permission review had no user messages to judge against")
+    this.name = "MissingUserContextError"
+  }
 }
 
 /**
@@ -164,6 +177,7 @@ export async function decide(
   const reviewKey = concurrentReviewKey(request, input)
   let shared = state.sharedReviews.get(reviewKey)
   if (!policyDecision && !cachedDecision && !shared) {
+    if (state.requireUserMessages && input.context.userMessages.length === 0) throw new MissingUserContextError()
     const controller = new AbortController()
     const review: SharedReview = {
       decision: modelDecision(context, client, config, input, AbortSignal.any([reviewSignal, controller.signal])),
@@ -326,7 +340,13 @@ function concurrentReviewKey(
   request: PermissionRequest,
   input: Awaited<ReturnType<typeof collectReviewInput>>,
 ): string {
-  return JSON.stringify([input.context.rootSessionID, request.action, request.resources, input.request.toolInput])
+  return JSON.stringify([
+    input.context.rootSessionID,
+    request.action,
+    request.resources,
+    input.request.toolInput,
+    input.request.metadata,
+  ])
 }
 
 function decisionSource(
