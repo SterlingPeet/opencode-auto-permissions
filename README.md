@@ -84,7 +84,7 @@ For each supported permission request, Auto Permissions combines deterministic s
 - Broad boundary globs such as `/tmp/*` are not treated as the requested scope when the tool input identifies a precise target; the reviewer evaluates the actual operation and latest user request.
 - The reviewer is tuned for unattended agents: it defaults to approval when an action reasonably serves the task and uses `ask` only as a last resort.
 - If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. On the V2 path, which has no structured output, a reply that is not JSON is re-asked once from the same model with a stricter instruction before that failure counts.
-- If no fallback is available or both attempts fail, the request is rejected automatically. The main agent is told that no safety decision was reached, that execution remains blocked, and that it may retry the same action once so a fresh review can run. A technical failure is never presented as a safety denial.
+- If no fallback is available or both attempts fail, the request is rejected automatically. The main agent is told that no safety decision was reached, that execution remains blocked, and that it may retry the same action once so a fresh review can run. A technical failure is never presented as a safety denial. With `serverReview`, a failed review is left to you instead (see Server Review).
 - Reviewer sessions are hidden and cannot execute real tools. They deny all permissions, except that OpenCode free-tier models keep an unreachable `read` allow rule because the free-tier gateway rejects requests that omit the read tool.
 - Denial continuations are only delivered to resolved root sessions. A denied subagent stays terminated instead of being resumed after its parent task handle has already ended; unknown parentage also fails closed.
 - Only a small, recent window of relevant user context is sent for review.
@@ -94,7 +94,7 @@ The reviewer never receives authority to execute the requested action. It always
 
 Reviewer sessions are standalone and deleted after each decision or failure. Startup never deletes reviewer sessions because multiple OpenCode processes may be reviewing permissions concurrently; one process must not delete another process's active review.
 
-Auto Permissions never asks the user to resolve a permission prompt. When the reviewer cannot safely approve, it denies and tells the coding agent why, what safer alternative to try, and to continue autonomously where possible.
+Outside `serverReview`, Auto Permissions never asks the user to resolve a permission prompt. When the reviewer judges an action unsafe, it denies and tells the coding agent why, what safer alternative to try, and to continue autonomously where possible; when the review itself fails, the action stays blocked and the agent may retry it once. With `serverReview`, approvals and denials stay automatic, but a failed review leaves the request to you through OpenCode's normal prompt.
 
 Denial and failure continuations preserve the main session's selected agent, model, and variant. A permission decision does not reset the primary agent's reasoning effort.
 
@@ -105,6 +105,12 @@ For repeatable low-risk operations, the reviewer may choose `allow_session`. The
 Code-side guardrails downgrade `allow_session` to a one-time approval when patterns are missing or broad, or when the action involves edits, external-directory boundaries, `sudo`, deletion, push, publish, deploy, credentials, destructive Git, or other non-repeatable effects. Eligible examples include narrow reads/searches and commands such as a specific `git fetch` or test invocation. Set `sessionApprovals: false` to force all model approvals to remain one-time.
 
 When an action is rejected, Auto Permissions returns the reason to the main agent and asks it to continue with a safer alternative when possible. For example, it can target a generated subdirectory instead of a broad recursive delete, use `--force-with-lease` instead of an unrestricted force push, or inspect a deployment plan before applying it. A denial should redirect useful work rather than end the session.
+
+### Server Review (OpenCode 2)
+
+By default the TUI reviews a request after OpenCode has published it, so terminal tab markers and agent-status notifiers alert on every `ask`, including the ones the reviewer approves a second later. Set `serverReview: true` in the `opencode.json` entry to review in the server plugin's permission `evaluate` hook instead, which runs before OpenCode creates the request: an approved call runs and a denied one returns the reason to the agent, and neither is ever published as `permission.asked`.
+
+If the review fails or exceeds `timeoutMs` capped at 30 seconds (one budget for the whole hook, including any fallback attempt, since the agent's turn waits on it), the hook leaves the request at `ask` with a message saying the automatic review was unavailable, and you get OpenCode's normal prompt; the server and TUI reviewers recognize that message and do not review the request again. It does the same when a model review would have no user messages to judge against, which can happen after compaction, because the reviewer defaults to approval. In an automation run, where nobody can answer, OpenCode then settles a request left at `ask` with the run's unattended rules: it allows what those rules allow and denies the rest. Evaluations without a tool call, such as OpenCode's own `assertNotDenied` and `allows` probes in automation runs, are left to OpenCode's rules unreviewed. The hook does not run in `shadow` mode, and it settles each call once, so `allow_session` approves only that call. Load the plugin globally: OpenCode runs a hook only for sessions in its plugin's location.
 
 ## Choosing Rules
 
@@ -129,9 +135,10 @@ The plugin tuple accepts these options:
 | `model` | Requesting session model | Optional dedicated reviewer model in `provider/model` form. |
 | `variant` | Selected model's default | Optional reviewer-only model variant. Use `"low"` when supported for faster decisions. |
 | `sessionApprovals` | `true` | Reuse guarded, pattern-specific approvals immediately for the current session. Set `false` for one-time approvals only. |
-| `timeoutMs` | `30000` | Per-model timeout from 100 to 300,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 10 minutes at the maximum (plus context/reply overhead). Raise this for slow local models. |
+| `timeoutMs` | `30000` | Per-model timeout from 100 to 300,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 10 minutes at the maximum (plus context/reply overhead). Raise this for slow local models. With `serverReview`, the hook's whole review, including any fallback, shares one budget of `timeoutMs` capped at 30 seconds, because the agent's turn waits on it. |
 | `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
+| `serverReview` | `false` | OpenCode 2 only. Review in the server's permission `evaluate` hook so approved and denied calls are never published as permission requests; a failed review falls back to the normal prompt. See Server Review. |
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |
 | `structuredEndpoint` | unset | Send reviews for one OpenAI-compatible provider straight to its `/chat/completions` with a `json_schema` response format. `{ "providerID": "router", "baseURL": "http://localhost:8080/v1", "apiKey": "local" }`; `providerID` and `baseURL` are required, and `apiKey` or `apiKeyEnv` (an environment variable name) is optional, not both. Applies to every review whose model uses that provider, including a same-provider session fallback. `variant` is ignored on this path. It is a direct, tool-less HTTP call with no hidden reviewer session. |
