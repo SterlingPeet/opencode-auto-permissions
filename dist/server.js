@@ -22714,6 +22714,7 @@ function parseConfig(options2) {
     userMessageCount: boundedInteger(options2.userMessageCount, DEFAULT_USER_MESSAGE_COUNT, 1, 20, "userMessageCount"),
     shadow: options2.shadow === true,
     sessionApprovals: options2.sessionApprovals !== false,
+    serverReview: options2.serverReview === true,
     runtime: parseRuntime(options2.runtime),
     diagnosticsPath: parseDiagnosticsPath(options2.debug),
     structuredEndpoint: parseStructuredEndpoint(options2.structuredEndpoint)
@@ -22796,6 +22797,176 @@ function boundedInteger(value3, fallback, minimum, maximum, name) {
   return value3;
 }
 
+// src/evaluate.ts
+import { randomUUID } from "crypto";
+
+// src/context.ts
+var MAX_MESSAGE_CHARS = 4000;
+var AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:";
+var REVIEW_ESCALATED_PREFIX = "[Auto Permissions] Automatic review unavailable";
+function normalizeAskedEvent(event) {
+  if (!isRecord(event))
+    return null;
+  const data = payload(event);
+  if (event.type === "permission.v2.asked" || event.type === "permission.asked" && validRequest(data, "action", "resources")) {
+    if (!validRequest(data, "action", "resources"))
+      return null;
+    return {
+      id: data.id,
+      sessionID: data.sessionID,
+      action: data.action,
+      resources: [...data.resources],
+      always: stringArray(data.always ?? data.save),
+      ...normalizeTool(data.source) ? { source: normalizeTool(data.source) } : {},
+      ...typeof data.message === "string" ? { message: data.message } : {},
+      protocol: "v2"
+    };
+  }
+  if (event.type !== "permission.asked" && event.type !== "permission.updated")
+    return null;
+  if (!data || typeof data.id !== "string" || typeof data.sessionID !== "string")
+    return null;
+  const action = typeof data.permission === "string" ? data.permission : data.type;
+  const rawResources = data.patterns ?? data.pattern;
+  const resources = Array.isArray(rawResources) ? rawResources : typeof rawResources === "string" ? [rawResources] : [];
+  if (typeof action !== "string" || resources.length === 0 || !resources.every((item) => typeof item === "string"))
+    return null;
+  const tool = normalizeTool(data.tool) ? normalizeTool(data.tool) : typeof data.messageID === "string" && typeof data.callID === "string" ? { type: "tool", messageID: data.messageID, callID: data.callID } : undefined;
+  return {
+    id: data.id,
+    sessionID: data.sessionID,
+    action,
+    resources,
+    always: stringArray(data.always),
+    ...tool ? { source: tool } : {},
+    protocol: "stable"
+  };
+}
+function normalizeRepliedEvent(event) {
+  if (!isRecord(event) || !["permission.v2.replied", "permission.replied"].includes(String(event.type)))
+    return null;
+  const data = payload(event);
+  const requestID = data?.requestID ?? data?.permissionID;
+  if (!isRecord(data) || typeof data.sessionID !== "string" || typeof requestID !== "string")
+    return null;
+  return { sessionID: data.sessionID, requestID };
+}
+async function collectReviewInput(context3, request3, userMessageCount) {
+  const rootSessionID = await context3.data.session.root(request3.sessionID);
+  await Promise.all([
+    context3.data.session.message.sync(rootSessionID),
+    request3.sessionID === rootSessionID ? Promise.resolve() : context3.data.session.message.sync(request3.sessionID)
+  ]);
+  const rootMessages = context3.data.session.message.list(rootSessionID);
+  const sessionMessages = request3.sessionID === rootSessionID ? [] : context3.data.session.message.list(request3.sessionID);
+  const userMessages = [...rootMessages, ...sessionMessages].flatMap((message) => {
+    const text = userText(message);
+    return text === undefined ? [] : [text.slice(0, MAX_MESSAGE_CHARS)];
+  }).slice(-userMessageCount);
+  const currentDirectory = directory(context3);
+  const model = latestUserModel(sessionMessages) ?? latestUserModel(rootMessages);
+  return {
+    request: {
+      action: request3.action,
+      resources: [...request3.resources],
+      sessionPatterns: [...request3.always],
+      ...request3.source?.type === "tool" ? { toolInput: findToolInput(context3, request3.sessionID, request3.source.messageID, request3.source.callID) } : {}
+    },
+    context: {
+      rootSessionID,
+      ...currentDirectory ? { directory: currentDirectory } : {},
+      userMessages,
+      ...model ? { model } : {}
+    }
+  };
+}
+function latestUserModel(messages) {
+  for (let index2 = messages.length - 1;index2 >= 0; index2--) {
+    const message = messages[index2];
+    if (!isRecord(message))
+      continue;
+    const model = messageModel(message);
+    if (model)
+      return model;
+  }
+  return;
+}
+function messageModel(message) {
+  const info = isRecord(message.info) ? message.info : message;
+  const role = info.role ?? message.type;
+  if (role !== "user" && role !== "assistant")
+    return;
+  const raw = isRecord(info.model) ? info.model : undefined;
+  if (!raw)
+    return;
+  const providerID = raw.providerID;
+  const id2 = raw.modelID ?? raw.id;
+  if (typeof providerID !== "string" || typeof id2 !== "string")
+    return;
+  const variant = typeof raw.variant === "string" ? raw.variant : undefined;
+  return { providerID, id: id2, ...variant ? { variant } : {} };
+}
+async function isRequestPending(context3, request3) {
+  await context3.data.session.permission.sync(request3.sessionID);
+  return context3.data.session.permission.list(request3.sessionID)?.some((item) => item.id === request3.id) ?? false;
+}
+function findToolInput(context3, sessionID, messageID, callID) {
+  const message = context3.data.session.message.get(sessionID, messageID);
+  if (!isRecord(message))
+    return;
+  if (message.type === "assistant" && Array.isArray(message.content)) {
+    const tool = message.content.find((item) => isRecord(item) && item.type === "tool" && (item.id === callID || item.callID === callID));
+    if (isRecord(tool) && isRecord(tool.state))
+      return tool.state.input;
+  }
+  if (isRecord(message.info) && message.info.role === "assistant" && Array.isArray(message.parts)) {
+    const tool = message.parts.find((part) => isRecord(part) && part.type === "tool" && (part.callID === callID || part.id === callID));
+    if (isRecord(tool) && isRecord(tool.state))
+      return tool.state.input;
+  }
+  return;
+}
+function directory(context3) {
+  return context3.location?.directory ?? context3.data.location?.default().directory;
+}
+function isRecord(value3) {
+  return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
+}
+function payload(event) {
+  return isRecord(event.data) ? event.data : isRecord(event.properties) ? event.properties : null;
+}
+function validRequest(data, actionKey, resourcesKey) {
+  return Boolean(data && typeof data.id === "string" && typeof data.sessionID === "string" && typeof data[actionKey] === "string" && Array.isArray(data[resourcesKey]) && data[resourcesKey].every((item) => typeof item === "string"));
+}
+function normalizeTool(value3) {
+  if (!isRecord(value3) || value3.type !== undefined && value3.type !== "tool" || typeof value3.messageID !== "string") {
+    return;
+  }
+  const callID = typeof value3.callID === "string" ? value3.callID : value3.id;
+  return typeof callID === "string" ? { type: "tool", messageID: value3.messageID, callID } : undefined;
+}
+function stringArray(value3) {
+  return Array.isArray(value3) ? value3.filter((item) => typeof item === "string") : [];
+}
+function userText(message) {
+  if (!isRecord(message))
+    return;
+  if (message.type === "user" && typeof message.text === "string") {
+    return isPluginContinuation(message.text) ? undefined : message.text;
+  }
+  if (!isRecord(message.info) || message.info.role !== "user" || !Array.isArray(message.parts))
+    return;
+  const text = message.parts.filter((part) => isRecord(part) && part.type === "text" && typeof part.text === "string" && part.synthetic !== true && part.ignored !== true).map((part) => part.text).join(`
+`);
+  return text && !isPluginContinuation(text) ? text : undefined;
+}
+function escalatedByEvaluateHook(request3) {
+  return request3.message?.startsWith(REVIEW_ESCALATED_PREFIX) ?? false;
+}
+function isPluginContinuation(text) {
+  return text.trimStart().startsWith(AUTO_PERMISSIONS_MESSAGE_PREFIX);
+}
+
 // src/opencode-client.ts
 import { mkdir as mkdir2 } from "fs/promises";
 import { tmpdir } from "os";
@@ -22806,6 +22977,7 @@ var REVIEWER_PERMISSIONS = [
 ];
 var REVIEWER_DIRECTORY = join3(tmpdir(), "opencode-auto-permissions", "reviewer");
 var REVIEWER_SESSION_TITLE = "Auto Permissions review";
+var JSON_ONLY_INSTRUCTION = `Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
 function parseReviewerJson(text) {
   try {
     return JSON.parse(text);
@@ -22891,7 +23063,7 @@ class OpenCodeClientAdapter {
         permission: REVIEWER_PERMISSIONS
       };
       const created = unwrapData(await session.create(createInput, { signal: input.signal }));
-      if (!isRecord(created) || typeof created.id !== "string") {
+      if (!isRecord2(created) || typeof created.id !== "string") {
         throw new Error("OpenCode failed to create a reviewer session");
       }
       sessionID = created.id;
@@ -23008,10 +23180,10 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       return;
     });
     if (!response2.ok) {
-      const message = isRecord(body) && isRecord(body.error) && typeof body.error.message === "string" ? body.error.message : "no content";
+      const message = isRecord2(body) && isRecord2(body.error) && typeof body.error.message === "string" ? body.error.message : "no content";
       throw new Error(`Structured endpoint request failed (HTTP ${response2.status}): ${message}`);
     }
-    const content = isRecord(body) && Array.isArray(body.choices) ? body.choices[0]?.message?.content : undefined;
+    const content = isRecord2(body) && Array.isArray(body.choices) ? body.choices[0]?.message?.content : undefined;
     if (typeof content !== "string" || !content.trim())
       throw new Error("Structured endpoint returned no content");
     return parseReviewerJson(content);
@@ -23035,14 +23207,14 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
         model: input.model,
         location: { directory: REVIEWER_DIRECTORY }
       }, { signal: input.signal });
-      if (!isRecord(session) || typeof session.id !== "string")
+      if (!isRecord2(session) || typeof session.id !== "string")
         throw new Error("OpenCode failed to create a reviewer session");
       sessionID = session.id;
       const strictPrompt = `${input.prompt}
 
-Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
+${JSON_ONLY_INSTRUCTION}`;
       const result3 = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal });
-      if (!isRecord(result3) || typeof result3.text !== "string")
+      if (!isRecord2(result3) || typeof result3.text !== "string")
         throw new Error("OpenCode reviewer returned no text output");
       try {
         return parseReviewerJson(result3.text);
@@ -23060,7 +23232,7 @@ Return only one JSON object without Markdown fences with exactly these keys: "de
 
 Reply with only the JSON object, beginning with {"decision": and nothing before or after it.`
       }, { signal: input.signal });
-      if (!isRecord(retry3) || typeof retry3.text !== "string")
+      if (!isRecord2(retry3) || typeof retry3.text !== "string")
         throw new Error("OpenCode reviewer returned no text output");
       return parseReviewerJson(retry3.text);
     } finally {
@@ -23073,29 +23245,29 @@ Reply with only the JSON object, beginning with {"decision": and nothing before 
   }
 }
 function assistantStructured(value3) {
-  if (!isRecord(value3))
+  if (!isRecord2(value3))
     throw new Error("OpenCode reviewer returned an invalid response");
-  if (isRecord(value3.info) && value3.info.error)
+  if (isRecord2(value3.info) && value3.info.error)
     throw value3.info.error;
-  if (!isRecord(value3.info) || !("structured" in value3.info)) {
+  if (!isRecord2(value3.info) || !("structured" in value3.info)) {
     throw new Error("OpenCode reviewer returned no structured output");
   }
   return value3.info.structured;
 }
 function assistantText(value3) {
-  if (!isRecord(value3))
+  if (!isRecord2(value3))
     throw new Error("OpenCode reviewer returned an invalid response");
-  if (isRecord(value3.info) && value3.info.error)
+  if (isRecord2(value3.info) && value3.info.error)
     throw value3.info.error;
   if (!Array.isArray(value3.parts))
     throw new Error("OpenCode reviewer returned no text output");
-  const text = value3.parts.filter((part) => isRecord(part) && part.type === "text").map((part) => part.text).filter((part) => typeof part === "string").join("").trim();
+  const text = value3.parts.filter((part) => isRecord2(part) && part.type === "text").map((part) => part.text).filter((part) => typeof part === "string").join("").trim();
   if (!text)
     throw new Error("OpenCode reviewer returned no text output");
   return text;
 }
 function isStructuredOutputError(error) {
-  if (!isRecord(error))
+  if (!isRecord2(error))
     return false;
   if (error.name === "StructuredOutputError" || error._tag === "StructuredOutputError")
     return true;
@@ -23105,19 +23277,19 @@ function unwrapData(result3) {
   throwForResultError(result3);
   let value3 = result3;
   for (let depth = 0;depth < 3; depth++) {
-    if (!isRecord(value3) || !("data" in value3))
+    if (!isRecord2(value3) || !("data" in value3))
       break;
     value3 = value3.data;
   }
   return value3;
 }
 function throwForResultError(result3) {
-  if (!isRecord(result3) || !("error" in result3) || result3.error === undefined)
+  if (!isRecord2(result3) || !("error" in result3) || result3.error === undefined)
     return;
   throw result3.error;
 }
 function isNotFound(error) {
-  if (!isRecord(error))
+  if (!isRecord2(error))
     return false;
   const status = error.status ?? Reflect.get(error, "statusCode");
   if (status === 404)
@@ -23128,170 +23300,8 @@ function isNotFound(error) {
 function abortError(reason) {
   return new DOMException(typeof reason === "string" ? reason : "Review aborted", "AbortError");
 }
-function isRecord(value3) {
-  return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
-}
-
-// src/context.ts
-var MAX_MESSAGE_CHARS = 4000;
-var AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:";
-function normalizeAskedEvent(event) {
-  if (!isRecord2(event))
-    return null;
-  const data = payload(event);
-  if (event.type === "permission.v2.asked" || event.type === "permission.asked" && validRequest(data, "action", "resources")) {
-    if (!validRequest(data, "action", "resources"))
-      return null;
-    return {
-      id: data.id,
-      sessionID: data.sessionID,
-      action: data.action,
-      resources: [...data.resources],
-      always: stringArray(data.always ?? data.save),
-      ...normalizeTool(data.source) ? { source: normalizeTool(data.source) } : {},
-      protocol: "v2"
-    };
-  }
-  if (event.type !== "permission.asked" && event.type !== "permission.updated")
-    return null;
-  if (!data || typeof data.id !== "string" || typeof data.sessionID !== "string")
-    return null;
-  const action = typeof data.permission === "string" ? data.permission : data.type;
-  const rawResources = data.patterns ?? data.pattern;
-  const resources = Array.isArray(rawResources) ? rawResources : typeof rawResources === "string" ? [rawResources] : [];
-  if (typeof action !== "string" || resources.length === 0 || !resources.every((item) => typeof item === "string"))
-    return null;
-  const tool = normalizeTool(data.tool) ? normalizeTool(data.tool) : typeof data.messageID === "string" && typeof data.callID === "string" ? { type: "tool", messageID: data.messageID, callID: data.callID } : undefined;
-  return {
-    id: data.id,
-    sessionID: data.sessionID,
-    action,
-    resources,
-    always: stringArray(data.always),
-    ...tool ? { source: tool } : {},
-    protocol: "stable"
-  };
-}
-function normalizeRepliedEvent(event) {
-  if (!isRecord2(event) || !["permission.v2.replied", "permission.replied"].includes(String(event.type)))
-    return null;
-  const data = payload(event);
-  const requestID = data?.requestID ?? data?.permissionID;
-  if (!isRecord2(data) || typeof data.sessionID !== "string" || typeof requestID !== "string")
-    return null;
-  return { sessionID: data.sessionID, requestID };
-}
-async function collectReviewInput(context3, request3, userMessageCount) {
-  const rootSessionID = await context3.data.session.root(request3.sessionID);
-  await Promise.all([
-    context3.data.session.message.sync(rootSessionID),
-    request3.sessionID === rootSessionID ? Promise.resolve() : context3.data.session.message.sync(request3.sessionID)
-  ]);
-  const rootMessages = context3.data.session.message.list(rootSessionID);
-  const sessionMessages = request3.sessionID === rootSessionID ? [] : context3.data.session.message.list(request3.sessionID);
-  const userMessages = [...rootMessages, ...sessionMessages].flatMap((message) => {
-    const text = userText(message);
-    return text === undefined ? [] : [text.slice(0, MAX_MESSAGE_CHARS)];
-  }).slice(-userMessageCount);
-  const currentDirectory = directory(context3);
-  const model = latestUserModel(sessionMessages) ?? latestUserModel(rootMessages);
-  return {
-    request: {
-      action: request3.action,
-      resources: [...request3.resources],
-      sessionPatterns: [...request3.always],
-      ...request3.source?.type === "tool" ? { toolInput: findToolInput(context3, request3.sessionID, request3.source.messageID, request3.source.callID) } : {}
-    },
-    context: {
-      rootSessionID,
-      ...currentDirectory ? { directory: currentDirectory } : {},
-      userMessages,
-      ...model ? { model } : {}
-    }
-  };
-}
-function latestUserModel(messages) {
-  for (let index2 = messages.length - 1;index2 >= 0; index2--) {
-    const message = messages[index2];
-    if (!isRecord2(message))
-      continue;
-    const model = messageModel(message);
-    if (model)
-      return model;
-  }
-  return;
-}
-function messageModel(message) {
-  const info = isRecord2(message.info) ? message.info : message;
-  const role = info.role ?? message.type;
-  if (role !== "user" && role !== "assistant")
-    return;
-  const raw = isRecord2(info.model) ? info.model : undefined;
-  if (!raw)
-    return;
-  const providerID = raw.providerID;
-  const id2 = raw.modelID ?? raw.id;
-  if (typeof providerID !== "string" || typeof id2 !== "string")
-    return;
-  const variant = typeof raw.variant === "string" ? raw.variant : undefined;
-  return { providerID, id: id2, ...variant ? { variant } : {} };
-}
-async function isRequestPending(context3, request3) {
-  await context3.data.session.permission.sync(request3.sessionID);
-  return context3.data.session.permission.list(request3.sessionID)?.some((item) => item.id === request3.id) ?? false;
-}
-function findToolInput(context3, sessionID, messageID, callID) {
-  const message = context3.data.session.message.get(sessionID, messageID);
-  if (!isRecord2(message))
-    return;
-  if (message.type === "assistant" && Array.isArray(message.content)) {
-    const tool = message.content.find((item) => isRecord2(item) && item.type === "tool" && (item.id === callID || item.callID === callID));
-    if (isRecord2(tool) && isRecord2(tool.state))
-      return tool.state.input;
-  }
-  if (isRecord2(message.info) && message.info.role === "assistant" && Array.isArray(message.parts)) {
-    const tool = message.parts.find((part) => isRecord2(part) && part.type === "tool" && (part.callID === callID || part.id === callID));
-    if (isRecord2(tool) && isRecord2(tool.state))
-      return tool.state.input;
-  }
-  return;
-}
-function directory(context3) {
-  return context3.location?.directory ?? context3.data.location?.default().directory;
-}
 function isRecord2(value3) {
   return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
-}
-function payload(event) {
-  return isRecord2(event.data) ? event.data : isRecord2(event.properties) ? event.properties : null;
-}
-function validRequest(data, actionKey, resourcesKey) {
-  return Boolean(data && typeof data.id === "string" && typeof data.sessionID === "string" && typeof data[actionKey] === "string" && Array.isArray(data[resourcesKey]) && data[resourcesKey].every((item) => typeof item === "string"));
-}
-function normalizeTool(value3) {
-  if (!isRecord2(value3) || value3.type !== undefined && value3.type !== "tool" || typeof value3.messageID !== "string") {
-    return;
-  }
-  const callID = typeof value3.callID === "string" ? value3.callID : value3.id;
-  return typeof callID === "string" ? { type: "tool", messageID: value3.messageID, callID } : undefined;
-}
-function stringArray(value3) {
-  return Array.isArray(value3) ? value3.filter((item) => typeof item === "string") : [];
-}
-function userText(message) {
-  if (!isRecord2(message))
-    return;
-  if (message.type === "user" && typeof message.text === "string") {
-    return isPluginContinuation(message.text) ? undefined : message.text;
-  }
-  if (!isRecord2(message.info) || message.info.role !== "user" || !Array.isArray(message.parts))
-    return;
-  const text = message.parts.filter((part) => isRecord2(part) && part.type === "text" && typeof part.text === "string" && part.synthetic !== true && part.ignored !== true).map((part) => part.text).join(`
-`);
-  return text && !isPluginContinuation(text) ? text : undefined;
-}
-function isPluginContinuation(text) {
-  return text.trimStart().startsWith(AUTO_PERMISSIONS_MESSAGE_PREFIX);
 }
 
 // src/policy.ts
@@ -23416,8 +23426,7 @@ function installReviewer(context3, overrides = {}) {
   const config = parseConfig(context3.options);
   const client = overrides.client ?? new OpenCodeClientAdapter(context3.client, { diagnosticsPath: config.diagnosticsPath, endpoint: config.structuredEndpoint });
   const inFlight = new Map;
-  const sharedReviews = new Map;
-  const sessionApprovals = new Set;
+  const state = { sharedReviews: new Map, sessionApprovals: new Set };
   const sharedReviewController = new AbortController;
   const configuredProtocols = overrides.protocols ?? ["stable", "v2"];
   const protocols = new Set(configuredProtocols);
@@ -23442,11 +23451,13 @@ function installReviewer(context3, overrides = {}) {
     const asked = normalizeAskedEvent(event);
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return;
+    if (escalatedByEvaluateHook(asked))
+      return;
     const controller = new AbortController;
     const startedAt = performance.now();
     writeReceived(config, asked);
     inFlight.set(asked.id, controller);
-    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal).catch(async (error) => {
+    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal).catch(async (error) => {
       if (controller.signal.aborted)
         return;
       await rejectAfterFailure(context3, client, config, asked, startedAt, error, overrides);
@@ -23460,11 +23471,13 @@ function installReviewer(context3, overrides = {}) {
     const asked = normalized && configuredProtocols.length === 1 ? { ...normalized, protocol: configuredProtocols[0] } : normalized;
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return;
+    if (escalatedByEvaluateHook(asked))
+      return;
     const controller = new AbortController;
     const startedAt = performance.now();
     writeReceived(config, asked);
     inFlight.set(asked.id, controller);
-    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal).catch(async (error) => {
+    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal).catch(async (error) => {
       if (controller.signal.aborted)
         return;
       await rejectAfterFailure(context3, client, config, asked, startedAt, error, overrides);
@@ -23482,29 +23495,29 @@ function installReviewer(context3, overrides = {}) {
       controller.abort("plugin disposed");
     sharedReviewController.abort("plugin disposed");
     inFlight.clear();
-    sharedReviews.clear();
-    sessionApprovals.clear();
+    state.sharedReviews.clear();
+    state.sessionApprovals.clear();
   };
 }
-async function reviewAndReply(context3, client, config, request3, parentSignal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewSignal) {
+async function decide(context3, client, config, request3, state, parentSignal, reviewSignal) {
   const input = await collectReviewInput(context3, request3, config.userMessageCount);
   if (parentSignal.aborted)
     return;
   const policyDecision = applyDeterministicPolicy(input);
   const approvalKey = reusableApprovalKey(config, request3, input);
-  const cachedDecision = !policyDecision && approvalKey && sessionApprovals.has(approvalKey) ? {
+  const cachedDecision = !policyDecision && approvalKey && state.sessionApprovals.has(approvalKey) ? {
     kind: "allow",
     reasonCode: "session_approval_reused",
     reason: "Reuses an approved narrow pattern from this session."
   } : undefined;
   const reviewKey = concurrentReviewKey(request3, input);
-  let shared = sharedReviews.get(reviewKey);
+  let shared = state.sharedReviews.get(reviewKey);
   if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context3, client, config, input, sharedReviewSignal);
-    sharedReviews.set(reviewKey, shared);
+    shared = modelDecision(context3, client, config, input, reviewSignal);
+    state.sharedReviews.set(reviewKey, shared);
     shared.finally(() => {
-      if (sharedReviews.get(reviewKey) === shared)
-        sharedReviews.delete(reviewKey);
+      if (state.sharedReviews.get(reviewKey) === shared)
+        state.sharedReviews.delete(reviewKey);
     }).catch(() => {
       return;
     });
@@ -23513,11 +23526,21 @@ async function reviewAndReply(context3, client, config, request3, parentSignal, 
   if (parentSignal.aborted)
     return;
   if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
-    sessionApprovals.add(approvalKey);
+    state.sessionApprovals.add(approvalKey);
   }
+  return { decision, source: decisionSource(policyDecision, cachedDecision), input };
+}
+function denialMessage(reason) {
+  return `Auto Permissions blocked this action: ${reason}`;
+}
+async function reviewAndReply(context3, client, config, request3, parentSignal, overrides, startedAt, state, sharedReviewSignal) {
+  const outcome = await decide(context3, client, config, request3, state, parentSignal, sharedReviewSignal);
+  if (!outcome)
+    return;
+  const { decision, source, input } = outcome;
   overrides.onDecision?.(request3, decision, config.shadow);
   if (config.shadow) {
-    writeDecision(config, request3, startedAt, decision, decisionSource(policyDecision, cachedDecision));
+    writeDecision(config, request3, startedAt, decision, source);
     return;
   }
   const pending = await isRequestPending(context3, request3);
@@ -23531,18 +23554,18 @@ async function reviewAndReply(context3, client, config, request3, parentSignal, 
       reply,
       protocol: request3.protocol
     });
-    writeDecision(config, request3, startedAt, decision, decisionSource(policyDecision, cachedDecision), result4, reply === "always" ? "session" : "once");
+    writeDecision(config, request3, startedAt, decision, source, result4, reply === "always" ? "session" : "once");
     return;
   }
   const result3 = await client.reply({
     sessionID: request3.sessionID,
     requestID: request3.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${decision.reason}`,
+    message: denialMessage(decision.reason),
     protocol: request3.protocol
   });
   context3.showToast?.({ title: "Blocked", message: decision.reason, variant: "warning", duration: 4000 });
-  writeDecision(config, request3, startedAt, decision, decisionSource(policyDecision, cachedDecision), result3);
+  writeDecision(config, request3, startedAt, decision, source, result3);
   if (result3 === "replied")
     context3.resumeAfterDenial?.(request3.sessionID, decision.reason);
 }
@@ -23557,7 +23580,7 @@ async function rejectAfterFailure(context3, client, config, request3, startedAt,
     sessionID: request3.sessionID,
     requestID: request3.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${reason}`,
+    message: denialMessage(reason),
     protocol: request3.protocol
   });
   context3.showToast?.({ title: "Blocked", message: reason, variant: "warning", duration: 4000 });
@@ -23752,6 +23775,210 @@ function sameModelId(left, right) {
   return left.providerID === right.providerID && left.id === right.id;
 }
 
+// src/evaluate.ts
+var CALL_VERDICT_TTL_MS = 60000;
+async function installEvaluateHook(host, overrides = {}) {
+  const config = parseConfig(host.options);
+  if (!config.serverReview || config.shadow)
+    return async () => {};
+  const client = overrides.client ?? new ServerReviewerClient(host, config);
+  const state = { sharedReviews: new Map, sessionApprovals: new Set };
+  const disposed = new AbortController;
+  const verdicts = new Map;
+  const expiries = new Set;
+  const remember = (key, verdict) => {
+    verdicts.set(key, verdict);
+    const expiry = setTimeout(() => {
+      expiries.delete(expiry);
+      if (verdicts.get(key) === verdict)
+        verdicts.delete(key);
+    }, CALL_VERDICT_TTL_MS);
+    expiry.unref?.();
+    expiries.add(expiry);
+  };
+  const registration = await host.permission.hook("evaluate", async (event) => {
+    try {
+      if (event.effect !== "ask" || event.agent === REVIEWER_AGENT_ID)
+        return;
+      const key = callKey(event);
+      const reused = key ? verdicts.get(key) : undefined;
+      const verdict = reused ?? await review(host, client, config, state, event, disposed.signal);
+      if (key && !reused)
+        remember(key, verdict);
+      apply2(event, verdict);
+    } catch (error) {
+      apply2(event, escalation(error));
+    }
+  });
+  return async () => {
+    disposed.abort("plugin disposed");
+    for (const expiry of expiries)
+      clearTimeout(expiry);
+    expiries.clear();
+    verdicts.clear();
+    state.sharedReviews.clear();
+    state.sessionApprovals.clear();
+    await registration.dispose();
+  };
+}
+async function review(host, client, config, state, event, disposedSignal) {
+  const request3 = {
+    id: event.source?.id ?? `evaluate_${randomUUID()}`,
+    sessionID: event.sessionID,
+    action: event.action,
+    resources: [...event.resources],
+    always: [],
+    ...event.source ? { source: { type: "tool", messageID: event.source.messageID, callID: event.source.id } } : {},
+    protocol: "v2"
+  };
+  const logged = { ...request3, protocol: "evaluate" };
+  const startedAt = performance.now();
+  writeReceived(config, logged);
+  const deadline = new AbortController;
+  const timer = setTimeout(() => deadline.abort("review timed out"), config.timeoutMs);
+  const signal = AbortSignal.any([disposedSignal, deadline.signal]);
+  const stop = abortRejection(signal);
+  try {
+    const outcome = await Promise.race([
+      decide(runtimeContext(host), client, config, request3, state, signal, signal),
+      stop.promise
+    ]);
+    if (!outcome)
+      throw stopError(deadline.signal);
+    writeDecision(config, logged, startedAt, outcome.decision, outcome.source);
+    return outcome.decision.kind === "deny" ? { effect: "deny", message: denialMessage(outcome.decision.reason) } : { effect: "allow" };
+  } catch (error) {
+    const failure = signal.aborted ? stopError(deadline.signal) : error;
+    writeFailure(config, logged, startedAt, failure);
+    return escalation(failure);
+  } finally {
+    clearTimeout(timer);
+    stop.cleanup();
+  }
+}
+function apply2(event, verdict) {
+  event.effect = verdict.effect;
+  if (verdict.message)
+    event.message = verdict.message;
+}
+function escalation(error) {
+  const cause = failureCategory(error) === "timeout" ? "the review timed out" : "the review failed";
+  return {
+    effect: "ask",
+    message: `${REVIEW_ESCALATED_PREFIX}: ${cause}, so this request needs your approval.`
+  };
+}
+function callKey(event) {
+  if (!event.source)
+    return;
+  return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources]);
+}
+function stopError(deadline) {
+  return deadline.aborted ? new Error("Permission review timed out") : new Error("Permission review cancelled");
+}
+function abortRejection(signal) {
+  let onAbort = () => {};
+  const promise3 = new Promise((_resolve, reject) => {
+    onAbort = () => reject(new Error("Permission review stopped"));
+    if (signal.aborted)
+      onAbort();
+    else
+      signal.addEventListener("abort", onAbort, { once: true });
+  });
+  promise3.catch(() => {
+    return;
+  });
+  return { promise: promise3, cleanup: () => signal.removeEventListener("abort", onAbort) };
+}
+function runtimeContext(host) {
+  const messages = new Map;
+  const parents = new Map;
+  const parentOf = async (sessionID) => {
+    if (!parents.has(sessionID)) {
+      const info = unwrap(await host.session.get({ sessionID }));
+      const parentID = isRecord4(info) && typeof info.parentID === "string" ? info.parentID : undefined;
+      parents.set(sessionID, parentID);
+    }
+    return parents.get(sessionID);
+  };
+  return {
+    options: host.options,
+    client: undefined,
+    data: {
+      on: () => () => {},
+      session: {
+        async root(sessionID) {
+          const seen = new Set;
+          let current = sessionID;
+          while (!seen.has(current)) {
+            seen.add(current);
+            const parentID = await parentOf(current);
+            if (!parentID)
+              return current;
+            current = parentID;
+          }
+          return sessionID;
+        },
+        get: (sessionID) => {
+          const parentID = parents.get(sessionID);
+          return { id: sessionID, ...parentID ? { parentID } : {} };
+        },
+        message: {
+          list: (sessionID) => messages.get(sessionID) ?? [],
+          get: (sessionID, messageID) => messages.get(sessionID)?.find((message) => isRecord4(message) && messageIdOf(message) === messageID),
+          async sync(sessionID) {
+            const value3 = unwrap(await host.session.context({ sessionID }));
+            messages.set(sessionID, Array.isArray(value3) ? [...value3] : []);
+          }
+        },
+        permission: {
+          list: () => [],
+          sync: async () => {}
+        }
+      }
+    },
+    ...host.location?.directory ? { location: { directory: host.location.directory } } : {}
+  };
+}
+
+class ServerReviewerClient {
+  host;
+  config;
+  endpoint;
+  constructor(host, config) {
+    this.host = host;
+    this.config = config;
+    this.endpoint = new OpenCodeClientAdapter(undefined, {
+      diagnosticsPath: config.diagnosticsPath,
+      endpoint: config.structuredEndpoint
+    });
+  }
+  async generate(input) {
+    if (this.config.structuredEndpoint?.providerID === input.model.providerID)
+      return this.endpoint.generate(input);
+    const result3 = await this.host.generate.text({ model: input.model, prompt: `${REVIEWER_SYSTEM_PROMPT}
+
+${input.prompt}
+
+${JSON_ONLY_INSTRUCTION}` }, { signal: input.signal });
+    if (!isRecord4(result3) || typeof result3.text !== "string")
+      throw new Error("OpenCode reviewer returned no text output");
+    return parseReviewerJson(result3.text);
+  }
+  async reply() {
+    throw new Error("The evaluate hook settles requests in place and never replies");
+  }
+}
+function messageIdOf(message) {
+  return isRecord4(message.info) ? message.info.id : message.id;
+}
+function unwrap(value3) {
+  return isRecord4(value3) && "data" in value3 && !("id" in value3) ? value3.data : value3;
+}
+function isRecord4(value3) {
+  return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
+}
+
 // src/stable.ts
 function createStableRuntime(injectedClient, options2, directory2) {
   const client = compatibleClient(injectedClient);
@@ -23771,11 +23998,11 @@ function createStableRuntime(injectedClient, options2, directory2) {
       handler(event);
   };
   const syncMessages = async (sessionID) => {
-    const result3 = unwrap(await client.session.messages({ path: { id: sessionID }, query: { directory: directory2, limit: 200 } }));
+    const result3 = unwrap2(await client.session.messages({ path: { id: sessionID }, query: { directory: directory2, limit: 200 } }));
     messages.set(sessionID, Array.isArray(result3) ? result3 : []);
   };
   const syncPermissions = async () => {
-    const result3 = unwrap(await client.permission.list({ directory: directory2 }));
+    const result3 = unwrap2(await client.permission.list({ directory: directory2 }));
     if (!Array.isArray(result3))
       return;
     pending.clear();
@@ -23792,8 +24019,8 @@ function createStableRuntime(injectedClient, options2, directory2) {
       seen.add(current);
       let session = sessions.get(current);
       if (!session) {
-        const result3 = unwrap(await client.session.get({ path: { id: current }, query: { directory: directory2 } }));
-        if (!isRecord4(result3) || typeof result3.id !== "string")
+        const result3 = unwrap2(await client.session.get({ path: { id: current }, query: { directory: directory2 } }));
+        if (!isRecord5(result3) || typeof result3.id !== "string")
           return sessionID;
         session = {
           id: result3.id,
@@ -23867,8 +24094,8 @@ function createStableRuntime(injectedClient, options2, directory2) {
     async version() {
       if (typeof client.global?.health !== "function")
         return;
-      const result3 = unwrap(await client.global.health());
-      return isRecord4(result3) && typeof result3.version === "string" ? result3.version : undefined;
+      const result3 = unwrap2(await client.global.health());
+      return isRecord5(result3) && typeof result3.version === "string" ? result3.version : undefined;
     },
     emit(event) {
       const asked = normalizeAskedEvent(event);
@@ -23897,13 +24124,13 @@ function createStableRuntime(injectedClient, options2, directory2) {
 function latestUserRouting(messages) {
   for (let index2 = messages.length - 1;index2 >= 0; index2--) {
     const message = messages[index2];
-    if (!isRecord4(message))
+    if (!isRecord5(message))
       continue;
-    const info = isRecord4(message.info) ? message.info : message;
+    const info = isRecord5(message.info) ? message.info : message;
     if (info.role !== "user")
       continue;
     const agent = typeof info.agent === "string" ? info.agent : undefined;
-    const modelValue = isRecord4(info.model) ? info.model : undefined;
+    const modelValue = isRecord5(info.model) ? info.model : undefined;
     const providerID = modelValue?.providerID;
     const modelID = modelValue?.modelID ?? modelValue?.id;
     const model = typeof providerID === "string" && typeof modelID === "string" ? { providerID, modelID } : undefined;
@@ -23922,8 +24149,8 @@ async function waitForIdle(client, sessionID, directory2, signal) {
     return !signal.aborted;
   }
   for (let attempt = 0;attempt < 50 && !signal.aborted; attempt++) {
-    const statuses = unwrap(await client.session.status({ query: { directory: directory2 } }));
-    if (!isRecord4(statuses) || !isRecord4(statuses[sessionID]) || statuses[sessionID].type === "idle")
+    const statuses = unwrap2(await client.session.status({ query: { directory: directory2 } }));
+    if (!isRecord5(statuses) || !isRecord5(statuses[sessionID]) || statuses[sessionID].type === "idle")
       return true;
     await delay3(100, signal);
   }
@@ -23949,26 +24176,26 @@ function protocolForVersion(version) {
   return major >= 2 ? "v2" : "stable";
 }
 function compatibleClient(value3) {
-  if (isRecord4(value3))
+  if (isRecord5(value3))
     return value3;
   throw new Error("OpenCode compatible authenticated client is unavailable");
 }
-function unwrap(result3) {
+function unwrap2(result3) {
   if (result3?.error)
     throw result3.error;
   let value3 = result3?.data ?? result3;
-  if (isRecord4(value3) && "data" in value3)
+  if (isRecord5(value3) && "data" in value3)
     value3 = value3.data;
   return value3;
 }
 function messageIDOf(value3) {
-  if (!isRecord4(value3))
+  if (!isRecord5(value3))
     return;
   if (typeof value3.id === "string")
     return value3.id;
-  return isRecord4(value3.info) && typeof value3.info.id === "string" ? value3.info.id : undefined;
+  return isRecord5(value3.info) && typeof value3.info.id === "string" ? value3.info.id : undefined;
 }
-function isRecord4(value3) {
+function isRecord5(value3) {
   return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
 }
 
@@ -23989,6 +24216,7 @@ var v2Plugin = exports_plugin.define({
         agent.permissions = [{ action: "*", resource: "*", effect: "deny" }];
       });
     });
+    return installEvaluateHook(context3);
   }
 });
 var legacyPlugin = async (input, options2 = {}) => {

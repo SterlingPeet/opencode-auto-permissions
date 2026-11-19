@@ -121,6 +121,7 @@ var PluginContext = createContext();
 // src/context.ts
 var MAX_MESSAGE_CHARS = 4000;
 var AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:";
+var REVIEW_ESCALATED_PREFIX = "[Auto Permissions] Automatic review unavailable";
 function normalizeAskedEvent(event) {
   if (!isRecord(event))
     return null;
@@ -135,6 +136,7 @@ function normalizeAskedEvent(event) {
       resources: [...data.resources],
       always: stringArray(data.always ?? data.save),
       ...normalizeTool(data.source) ? { source: normalizeTool(data.source) } : {},
+      ...typeof data.message === "string" ? { message: data.message } : {},
       protocol: "v2"
     };
   }
@@ -276,6 +278,9 @@ function userText(message) {
 `);
   return text && !isPluginContinuation(text) ? text : undefined;
 }
+function escalatedByEvaluateHook(request) {
+  return request.message?.startsWith(REVIEW_ESCALATED_PREFIX) ?? false;
+}
 function isPluginContinuation(text) {
   return text.trimStart().startsWith(AUTO_PERMISSIONS_MESSAGE_PREFIX);
 }
@@ -400,6 +405,7 @@ function parseConfig(options) {
     userMessageCount: boundedInteger(options.userMessageCount, DEFAULT_USER_MESSAGE_COUNT, 1, 20, "userMessageCount"),
     shadow: options.shadow === true,
     sessionApprovals: options.sessionApprovals !== false,
+    serverReview: options.serverReview === true,
     runtime: parseRuntime(options.runtime),
     diagnosticsPath: parseDiagnosticsPath(options.debug),
     structuredEndpoint: parseStructuredEndpoint(options.structuredEndpoint)
@@ -538,6 +544,7 @@ var REVIEWER_PERMISSIONS = [
 ];
 var REVIEWER_DIRECTORY = join2(tmpdir(), "opencode-auto-permissions", "reviewer");
 var REVIEWER_SESSION_TITLE = "Auto Permissions review";
+var JSON_ONLY_INSTRUCTION = `Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
 function parseReviewerJson(text) {
   try {
     return JSON.parse(text);
@@ -772,7 +779,7 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       sessionID = session.id;
       const strictPrompt = `${input.prompt}
 
-Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
+${JSON_ONLY_INSTRUCTION}`;
       const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal });
       if (!isRecord2(result) || typeof result.text !== "string")
         throw new Error("OpenCode reviewer returned no text output");
@@ -986,8 +993,7 @@ function installReviewer(context, overrides = {}) {
   const config = parseConfig(context.options);
   const client = overrides.client ?? new OpenCodeClientAdapter(context.client, { diagnosticsPath: config.diagnosticsPath, endpoint: config.structuredEndpoint });
   const inFlight = new Map;
-  const sharedReviews = new Map;
-  const sessionApprovals = new Set;
+  const state = { sharedReviews: new Map, sessionApprovals: new Set };
   const sharedReviewController = new AbortController;
   const configuredProtocols = overrides.protocols ?? ["stable", "v2"];
   const protocols = new Set(configuredProtocols);
@@ -1012,11 +1018,13 @@ function installReviewer(context, overrides = {}) {
     const asked = normalizeAskedEvent(event);
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return;
+    if (escalatedByEvaluateHook(asked))
+      return;
     const controller = new AbortController;
     const startedAt = performance.now();
     writeReceived(config, asked);
     inFlight.set(asked.id, controller);
-    reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal).catch(async (error) => {
+    reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal).catch(async (error) => {
       if (controller.signal.aborted)
         return;
       await rejectAfterFailure(context, client, config, asked, startedAt, error, overrides);
@@ -1030,11 +1038,13 @@ function installReviewer(context, overrides = {}) {
     const asked = normalized && configuredProtocols.length === 1 ? { ...normalized, protocol: configuredProtocols[0] } : normalized;
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return;
+    if (escalatedByEvaluateHook(asked))
+      return;
     const controller = new AbortController;
     const startedAt = performance.now();
     writeReceived(config, asked);
     inFlight.set(asked.id, controller);
-    reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal).catch(async (error) => {
+    reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal).catch(async (error) => {
       if (controller.signal.aborted)
         return;
       await rejectAfterFailure(context, client, config, asked, startedAt, error, overrides);
@@ -1052,29 +1062,29 @@ function installReviewer(context, overrides = {}) {
       controller.abort("plugin disposed");
     sharedReviewController.abort("plugin disposed");
     inFlight.clear();
-    sharedReviews.clear();
-    sessionApprovals.clear();
+    state.sharedReviews.clear();
+    state.sessionApprovals.clear();
   };
 }
-async function reviewAndReply(context, client, config, request, parentSignal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewSignal) {
+async function decide(context, client, config, request, state, parentSignal, reviewSignal) {
   const input = await collectReviewInput(context, request, config.userMessageCount);
   if (parentSignal.aborted)
     return;
   const policyDecision = applyDeterministicPolicy(input);
   const approvalKey = reusableApprovalKey(config, request, input);
-  const cachedDecision = !policyDecision && approvalKey && sessionApprovals.has(approvalKey) ? {
+  const cachedDecision = !policyDecision && approvalKey && state.sessionApprovals.has(approvalKey) ? {
     kind: "allow",
     reasonCode: "session_approval_reused",
     reason: "Reuses an approved narrow pattern from this session."
   } : undefined;
   const reviewKey = concurrentReviewKey(request, input);
-  let shared = sharedReviews.get(reviewKey);
+  let shared = state.sharedReviews.get(reviewKey);
   if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context, client, config, input, sharedReviewSignal);
-    sharedReviews.set(reviewKey, shared);
+    shared = modelDecision(context, client, config, input, reviewSignal);
+    state.sharedReviews.set(reviewKey, shared);
     shared.finally(() => {
-      if (sharedReviews.get(reviewKey) === shared)
-        sharedReviews.delete(reviewKey);
+      if (state.sharedReviews.get(reviewKey) === shared)
+        state.sharedReviews.delete(reviewKey);
     }).catch(() => {
       return;
     });
@@ -1083,11 +1093,21 @@ async function reviewAndReply(context, client, config, request, parentSignal, ov
   if (parentSignal.aborted)
     return;
   if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
-    sessionApprovals.add(approvalKey);
+    state.sessionApprovals.add(approvalKey);
   }
+  return { decision, source: decisionSource(policyDecision, cachedDecision), input };
+}
+function denialMessage(reason) {
+  return `Auto Permissions blocked this action: ${reason}`;
+}
+async function reviewAndReply(context, client, config, request, parentSignal, overrides, startedAt, state, sharedReviewSignal) {
+  const outcome = await decide(context, client, config, request, state, parentSignal, sharedReviewSignal);
+  if (!outcome)
+    return;
+  const { decision, source, input } = outcome;
   overrides.onDecision?.(request, decision, config.shadow);
   if (config.shadow) {
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision));
+    writeDecision(config, request, startedAt, decision, source);
     return;
   }
   const pending = await isRequestPending(context, request);
@@ -1101,18 +1121,18 @@ async function reviewAndReply(context, client, config, request, parentSignal, ov
       reply,
       protocol: request.protocol
     });
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result2, reply === "always" ? "session" : "once");
+    writeDecision(config, request, startedAt, decision, source, result2, reply === "always" ? "session" : "once");
     return;
   }
   const result = await client.reply({
     sessionID: request.sessionID,
     requestID: request.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${decision.reason}`,
+    message: denialMessage(decision.reason),
     protocol: request.protocol
   });
   context.showToast?.({ title: "Blocked", message: decision.reason, variant: "warning", duration: 4000 });
-  writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result);
+  writeDecision(config, request, startedAt, decision, source, result);
   if (result === "replied")
     context.resumeAfterDenial?.(request.sessionID, decision.reason);
 }
@@ -1127,7 +1147,7 @@ async function rejectAfterFailure(context, client, config, request, startedAt, e
     sessionID: request.sessionID,
     requestID: request.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${reason}`,
+    message: denialMessage(reason),
     protocol: request.protocol
   });
   context.showToast?.({ title: "Blocked", message: reason, variant: "warning", duration: 4000 });
