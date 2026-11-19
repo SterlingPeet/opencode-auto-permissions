@@ -16,6 +16,8 @@ export interface PermissionRequest {
   resources: string[]
   always: string[]
   source?: { type: "tool"; messageID: string; callID: string }
+  // Set by a server permission evaluate hook and copied onto the request.
+  message?: string
   protocol: PermissionProtocol
 }
 
