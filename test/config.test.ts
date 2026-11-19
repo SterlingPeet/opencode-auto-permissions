@@ -11,10 +11,17 @@ describe("parseConfig", () => {
       userMessageCount: 8,
       shadow: false,
       sessionApprovals: true,
+      serverReview: false,
       runtime: "auto",
       diagnosticsPath: undefined,
       structuredEndpoint: undefined,
     })
+  })
+
+  test("enables the server evaluate-hook review only when serverReview is true", () => {
+    expect(parseConfig({}).serverReview).toBeFalse()
+    expect(parseConfig({ serverReview: "yes" }).serverReview).toBeFalse()
+    expect(parseConfig({ serverReview: true }).serverReview).toBeTrue()
   })
 
   test("allows slashes inside the model id", () => {
