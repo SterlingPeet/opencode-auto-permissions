@@ -16,6 +16,11 @@ export interface PermissionRequest {
   resources: string[]
   always: string[]
   source?: { type: "tool"; messageID: string; callID: string }
+  // Set by a server permission evaluate hook and copied onto the request.
+  message?: string
+  // The evaluation's tool metadata (an edit's diff, a fetch's input), set only
+  // by the server evaluate hook.
+  metadata?: Record<string, unknown>
   protocol: PermissionProtocol
 }
 
@@ -30,6 +35,8 @@ export interface ReviewInput {
     resources: string[]
     sessionPatterns: string[]
     toolInput?: unknown
+    // Sent only when the tool input is not in the session context.
+    metadata?: Record<string, unknown>
   }
   context: {
     rootSessionID: string

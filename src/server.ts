@@ -1,6 +1,7 @@
 import { Plugin as V2Plugin } from "@opencode-ai/plugin"
 import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { parseConfig } from "./config.ts"
+import { installEvaluateHook } from "./evaluate.ts"
 import { installReviewer } from "./reviewer.ts"
 import { createStableRuntime, protocolForVersion } from "./stable.ts"
 
@@ -19,6 +20,7 @@ const v2Plugin = V2Plugin.define({
         agent.permissions = [{ action: "*", resource: "*", effect: "deny" }]
       })
     })
+    return installEvaluateHook(context)
   },
 })
 

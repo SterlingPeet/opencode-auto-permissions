@@ -23,7 +23,9 @@ export interface DiagnosticRecord {
     | "resume_failed"
   requestID?: string
   sessionID?: string
-  protocol?: PermissionRequest["protocol"]
+  // "evaluate" marks a decision made in the server's permission evaluate hook,
+  // which settles the request before OpenCode publishes it.
+  protocol?: PermissionRequest["protocol"] | "evaluate"
   action?: string
   resourceCount?: number
   elapsedMs?: number

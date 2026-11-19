@@ -2,6 +2,10 @@ import type { PermissionRequest, ReviewInput, ReviewModel, RuntimeContext } from
 
 const MAX_MESSAGE_CHARS = 4_000
 export const AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:"
+// Starts the message the server evaluate hook puts on a request it could not
+// review. OpenCode copies that message onto the published request, so the TUI
+// reviewer can recognize it and leave the request to the human.
+export const REVIEW_ESCALATED_PREFIX = "[Auto Permissions] Automatic review unavailable"
 
 export function normalizeAskedEvent(event: unknown): PermissionRequest | null {
   if (!isRecord(event)) return null
@@ -20,6 +24,7 @@ export function normalizeAskedEvent(event: unknown): PermissionRequest | null {
       // older betas and stable events still use "always".
       always: stringArray(data.always ?? data.save),
       ...(normalizeTool(data.source) ? { source: normalizeTool(data.source)! } : {}),
+      ...(typeof data.message === "string" ? { message: data.message } : {}),
       protocol: "v2",
     }
   }
@@ -78,15 +83,17 @@ export async function collectReviewInput(
     .slice(-userMessageCount)
   const currentDirectory = directory(context)
   const model = latestUserModel(sessionMessages) ?? latestUserModel(rootMessages)
+  const toolInput = request.source?.type === "tool"
+    ? findToolInput(context, request.sessionID, request.source.messageID, request.source.callID)
+    : undefined
 
   return {
     request: {
       action: request.action,
       resources: [...request.resources],
       sessionPatterns: [...request.always],
-      ...(request.source?.type === "tool"
-        ? { toolInput: findToolInput(context, request.sessionID, request.source.messageID, request.source.callID) }
-        : {}),
+      ...(request.source?.type === "tool" ? { toolInput } : {}),
+      ...(toolInput === undefined && request.metadata ? { metadata: request.metadata } : {}),
     },
     context: {
       rootSessionID,
@@ -210,6 +217,11 @@ function userText(message: unknown): string | undefined {
     .map((part) => part.text)
     .join("\n")
   return text && !isPluginContinuation(text) ? text : undefined
+}
+
+/** True when the server evaluate hook already tried to review this request. */
+export function escalatedByEvaluateHook(request: PermissionRequest): boolean {
+  return request.message?.startsWith(REVIEW_ESCALATED_PREFIX) ?? false
 }
 
 function isPluginContinuation(text: string): boolean {
