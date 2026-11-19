@@ -89,6 +89,7 @@ src/
 ├── server.ts            # Stable server plugin entry point
 ├── tui.ts               # V2 TUI plugin entry point
 ├── reviewer.ts          # Permission review pipeline (ask/reply/timeout)
+├── evaluate.ts          # V2 server permission evaluate hook (serverReview)
 ├── context.ts           # Event normalization and review context collection
 ├── policy.ts            # Deterministic safety rules
 ├── prompt.ts            # Reviewer prompt construction

@@ -104,6 +104,12 @@ Code-side guardrails downgrade `allow_session` to a one-time approval when patte
 
 When an action is rejected, Auto Permissions returns the reason to the main agent and asks it to continue with a safer alternative when possible. For example, it can target a generated subdirectory instead of a broad recursive delete, use `--force-with-lease` instead of an unrestricted force push, or inspect a deployment plan before applying it. A denial should redirect useful work rather than end the session.
 
+### Server Review (OpenCode 2)
+
+By default the TUI reviews a request after OpenCode has published it, so terminal tab markers and agent-status notifiers alert on every `ask`, including the ones the reviewer approves a second later. Set `serverReview: true` in the `opencode.json` entry to review in the server plugin's permission `evaluate` hook instead, which runs before OpenCode creates the request: an approved call runs and a denied one returns the reason to the agent, and neither is ever published as `permission.asked`.
+
+If the review fails or exceeds `timeoutMs` (one budget for the whole hook, since the agent's turn waits on it), the hook leaves the request at `ask` with a message saying the automatic review was unavailable, and you get OpenCode's normal prompt; the TUI reviewer recognizes that message and does not review the request again. Unattended sessions deny such a request, as OpenCode does for any unanswered `ask`. The hook does not run in `shadow` mode, and it settles each call once, so `allow_session` approves only that call. Load the plugin globally: OpenCode runs a hook only for sessions in its plugin's location.
+
 ## Choosing Rules
 
 Use OpenCode's three permission outcomes deliberately:
@@ -130,6 +136,7 @@ The plugin tuple accepts these options:
 | `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). |
 | `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
+| `serverReview` | `false` | OpenCode 2 only. Review in the server's permission `evaluate` hook so approved and denied calls are never published as permission requests; a failed review falls back to the normal prompt. See Server Review. |
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |
 | `structuredEndpoint` | unset | Send reviews for one OpenAI-compatible provider straight to its `/chat/completions` with a `json_schema` response format. `{ "providerID": "router", "baseURL": "http://localhost:8080/v1", "apiKey": "local" }`; `providerID` and `baseURL` are required, and `apiKey` or `apiKeyEnv` (an environment variable name) is optional, not both. Applies to every review whose model uses that provider, including a same-provider session fallback. `variant` is ignored on this path. It is a direct, tool-less HTTP call with no hidden reviewer session. |
