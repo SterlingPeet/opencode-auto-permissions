@@ -129,7 +129,7 @@ async function reviewAndReply(
   const reviewKey = concurrentReviewKey(request, input)
   let shared = sharedReviews.get(reviewKey)
   if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context, client, config, input, sharedReviewSignal)
+    shared = modelDecision(context, client, config, input, request.sessionID, sharedReviewSignal)
     sharedReviews.set(reviewKey, shared)
     void shared.finally(() => {
       if (sharedReviews.get(reviewKey) === shared) sharedReviews.delete(reviewKey)
@@ -341,6 +341,7 @@ async function modelDecision(
   client: ReviewerClient,
   config: Config,
   input: Awaited<ReturnType<typeof collectReviewInput>>,
+  judgedSessionID: string,
   parentSignal: AbortSignal,
 ): Promise<Decision> {
   const inheritedModel = input.context.model
@@ -370,7 +371,7 @@ async function modelDecision(
       ...diagnostic, timestamp: new Date().toISOString(), event: "model_attempt",
     })
     try {
-      const decision = await singleModelDecision(client, config, input, parentSignal, model)
+      const decision = await singleModelDecision(client, config, input, judgedSessionID, parentSignal, model)
       writeDiagnostic(config.diagnosticsPath, {
         ...diagnostic, timestamp: new Date().toISOString(), event: "model_decision", decision: decision.kind,
       })
@@ -399,6 +400,7 @@ async function singleModelDecision(
   client: ReviewerClient,
   config: Config,
   input: Awaited<ReturnType<typeof collectReviewInput>>,
+  judgedSessionID: string,
   parentSignal: AbortSignal,
   model: ReviewModel,
 ): Promise<Decision> {
@@ -419,7 +421,9 @@ async function singleModelDecision(
       structured = await Promise.race([aborted, client.generate({
         prompt: buildReviewPrompt(input),
         model,
-        parentSessionID: input.context.rootSessionID,
+        // The session whose tool call is judged (a subagent's own id, not its root).
+        // Passed beside ReviewInput because the prompt serializes ReviewInput whole.
+        parentSessionID: judgedSessionID,
         ...(input.context.directory ? { location: { directory: input.context.directory } } : {}),
         signal: timeout.signal,
       })])

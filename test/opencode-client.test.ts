@@ -676,6 +676,7 @@ describe("OpenCodeClientAdapter structured endpoint", () => {
     expect(requests[0]!.init.headers).toEqual({
       "Content-Type": "application/json",
       Authorization: "Bearer local",
+      "x-parent-session-id": "ses_parent",
     })
     expect(requests[0]!.init.signal).toBe(signal)
     expect(JSON.parse(requests[0]!.init.body)).toEqual({
@@ -731,8 +732,24 @@ describe("OpenCodeClientAdapter structured endpoint", () => {
       }) as any,
     })
     await adapter.generate(input())
-    expect(headers[0]).toEqual({ "Content-Type": "application/json" })
+    expect(headers[0]).toEqual({ "Content-Type": "application/json", "x-parent-session-id": "ses_parent" })
   })
+
+  test.each([["has a space", "ses parent"], ["is too long", `ses_${"a".repeat(61)}`], ["is empty", ""]])(
+    "omits x-parent-session-id when the id %s",
+    async (_label, parentSessionID) => {
+      const headers: any[] = []
+      const adapter = new OpenCodeClientAdapter(sdkClient([]), {
+        endpoint: { providerID: "router", baseURL: "http://localhost:8080/v1" },
+        fetchImpl: (async (_url: string, init: any) => {
+          headers.push(init.headers)
+          return jsonResponse({ choices: [{ message: { content } }] })
+        }) as any,
+      })
+      await adapter.generate(input(undefined, { parentSessionID }))
+      expect(headers[0]).toEqual({ "Content-Type": "application/json" })
+    },
+  )
 
   test("reports the HTTP status and error message on a non-2xx response", async () => {
     const adapter = new OpenCodeClientAdapter(sdkClient([]), {
