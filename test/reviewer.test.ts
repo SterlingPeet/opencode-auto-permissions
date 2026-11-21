@@ -155,6 +155,23 @@ describe("installReviewer", () => {
     dispose()
   })
 
+  test("passes the judged subagent session, not its root, as the parent session", async () => {
+    const app = harness({})
+    let parentSessionID: string | undefined
+    app.client.generate = async (input) => {
+      parentSessionID = input.parentSessionID
+      return { decision: "allow", reasonCode: "requested_action", reason: "The user requested this action." }
+    }
+    app.requests.push({ ...request("git push origin feature"), sessionID: "ses_child" })
+    const dispose = installReviewer(app.context, { client: app.client })
+
+    app.emit("permission.v2.asked", app.requests[0])
+    await settle()
+
+    expect(parentSessionID).toBe("ses_child")
+    dispose()
+  })
+
   test.each(["provider error", "timeout", "invalid output"])("falls back to the session model after a reviewer %s", async (failure) => {
     const app = harness({ model: "reviewer/fast", variant: "reviewer-only", timeoutMs: 100 })
     const models: Parameters<ReviewerClient["generate"]>[0]["model"][] = []

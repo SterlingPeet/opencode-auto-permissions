@@ -555,4 +555,24 @@ describe("installEvaluateHook", () => {
     expect(prompts[0]).toContain("Return only one JSON object")
     await dispose()
   })
+
+  test("sends the evaluated session as x-parent-session-id to a structured endpoint", async () => {
+    const app = harness({ structuredEndpoint: { providerID: "reviewer", baseURL: "http://localhost:8080/v1" } })
+    const headers: Record<string, string>[] = []
+    const fetchSpy = jest.spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init: any) => {
+      headers.push(init.headers)
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(ALLOW) } }] }))
+    }) as any)
+    try {
+      const dispose = await installEvaluateHook(app.host)
+
+      const event = await app.evaluate({ sessionID: "ses_child" })
+
+      expect(event.effect).toBe("allow")
+      expect(headers[0]?.["x-parent-session-id"]).toBe("ses_child")
+      await dispose()
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
 })
