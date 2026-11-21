@@ -22716,6 +22716,7 @@ function parseConfig(options2) {
     userMessageCount: boundedInteger(options2.userMessageCount, DEFAULT_USER_MESSAGE_COUNT, 1, 20, "userMessageCount"),
     shadow: options2.shadow === true,
     sessionApprovals: options2.sessionApprovals !== false,
+    serverReview: options2.serverReview === true,
     runtime: parseRuntime(options2.runtime),
     diagnosticsPath: parseDiagnosticsPath(options2.debug),
     structuredEndpoint: parseStructuredEndpoint(options2.structuredEndpoint)
@@ -22814,6 +22815,7 @@ function sameLocation(left, right) {
     return true;
   return left.directory === right.directory && (left.workspaceID ?? undefined) === (right.workspaceID ?? undefined);
 }
+var REVIEW_ESCALATED_PREFIX = "[Auto Permissions] Automatic review unavailable";
 function normalizeAskedEvent(event) {
   if (!isRecord(event))
     return null;
@@ -22828,6 +22830,7 @@ function normalizeAskedEvent(event) {
       resources: [...data.resources],
       always: stringArray(data.always ?? data.save),
       ...normalizeTool(data.source) ? { source: normalizeTool(data.source) } : {},
+      ...typeof data.message === "string" ? { message: data.message } : {},
       protocol: "v2"
     };
   }
@@ -22874,12 +22877,14 @@ async function collectReviewInput(context3, request3, userMessageCount) {
   }).slice(-userMessageCount);
   const currentDirectory = directory(context3);
   const model = latestUserModel(sessionMessages) ?? latestUserModel(rootMessages);
+  const toolInput = request3.source?.type === "tool" ? findToolInput(context3, request3.sessionID, request3.source.messageID, request3.source.callID) : undefined;
   return {
     request: {
       action: request3.action,
       resources: [...request3.resources],
       sessionPatterns: [...request3.always],
-      ...request3.source?.type === "tool" ? { toolInput: findToolInput(context3, request3.sessionID, request3.source.messageID, request3.source.callID) } : {}
+      ...request3.source?.type === "tool" ? { toolInput } : {},
+      ...toolInput === undefined && request3.metadata ? { metadata: request3.metadata } : {}
     },
     context: {
       rootSessionID,
@@ -22969,6 +22974,9 @@ function userText(message) {
 `);
   return text && !isPluginContinuation(text) ? text : undefined;
 }
+function escalatedByEvaluateHook(request3) {
+  return request3.message?.startsWith(REVIEW_ESCALATED_PREFIX) ?? false;
+}
 function isPluginContinuation(text) {
   return text.trimStart().startsWith(AUTO_PERMISSIONS_MESSAGE_PREFIX);
 }
@@ -22985,6 +22993,8 @@ var REVIEWER_PERMISSIONS = [
 var REVIEWER_DIRECTORY = join3(tmpdir(), "opencode-auto-permissions", "reviewer");
 var REVIEWER_READ_DISABLED = join3(REVIEWER_DIRECTORY, `.read-disabled-${randomUUID()}`, "*");
 var REVIEWER_SESSION_TITLE = "Auto Permissions review";
+var ROUTER_SESSION_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+var JSON_ONLY_INSTRUCTION = `Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
 function isOpenCodeProvider(model) {
   return model.providerID === "opencode";
 }
@@ -23183,7 +23193,8 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        ...apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+        ...apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        ...ROUTER_SESSION_ID.test(input.parentSessionID) ? { "x-parent-session-id": input.parentSessionID } : {}
       },
       body: JSON.stringify({
         model: input.model.id,
@@ -23235,7 +23246,7 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       sessionID = session.id;
       const strictPrompt = `${input.prompt}
 
-Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
+${JSON_ONLY_INSTRUCTION}`;
       const result3 = unwrapData(await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal }));
       if (!isRecord2(result3) || typeof result3.text !== "string")
         throw new Error("OpenCode reviewer returned no text output");
@@ -23326,6 +23337,9 @@ function abortError(reason) {
 function isRecord2(value3) {
   return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
 }
+
+// src/evaluate.ts
+import { createHash } from "crypto";
 
 // src/policy.ts
 var SHELL_COMPOSITION = /[;&|<>`\n]|\$\(|<\(|>\(/;
@@ -23449,8 +23463,7 @@ function installReviewer(context3, overrides = {}) {
   const config = parseConfig(context3.options);
   const client = overrides.client ?? new OpenCodeClientAdapter(context3.client, { diagnosticsPath: config.diagnosticsPath, endpoint: config.structuredEndpoint });
   const inFlight = new Map;
-  const sharedReviews = new Map;
-  const sessionApprovals = new Set;
+  const state = { sharedReviews: new Map, sessionApprovals: new Set };
   const sharedReviewController = new AbortController;
   const configuredProtocols = overrides.protocols ?? ["stable", "v2"];
   const protocols = new Set(configuredProtocols);
@@ -23475,11 +23488,13 @@ function installReviewer(context3, overrides = {}) {
     const asked = normalizeAskedEvent(event);
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return;
+    if (escalatedByEvaluateHook(asked))
+      return;
     const controller = new AbortController;
     const startedAt = performance.now();
     writeReceived(config, asked);
     inFlight.set(asked.id, controller);
-    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal).catch(async (error) => {
+    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal).catch(async (error) => {
       if (controller.signal.aborted)
         return;
       await rejectAfterFailure(context3, client, config, asked, startedAt, error, overrides);
@@ -23493,11 +23508,13 @@ function installReviewer(context3, overrides = {}) {
     const asked = normalized && configuredProtocols.length === 1 ? { ...normalized, protocol: configuredProtocols[0] } : normalized;
     if (!asked || !protocols.has(asked.protocol) || inFlight.has(asked.id))
       return;
+    if (escalatedByEvaluateHook(asked))
+      return;
     const controller = new AbortController;
     const startedAt = performance.now();
     writeReceived(config, asked);
     inFlight.set(asked.id, controller);
-    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal).catch(async (error) => {
+    reviewAndReply(context3, client, config, asked, controller.signal, overrides, startedAt, state, sharedReviewController.signal).catch(async (error) => {
       if (controller.signal.aborted)
         return;
       await rejectAfterFailure(context3, client, config, asked, startedAt, error, overrides);
@@ -23515,42 +23532,90 @@ function installReviewer(context3, overrides = {}) {
       controller.abort("plugin disposed");
     sharedReviewController.abort("plugin disposed");
     inFlight.clear();
-    sharedReviews.clear();
-    sessionApprovals.clear();
+    state.sharedReviews.clear();
+    state.sessionApprovals.clear();
   };
 }
-async function reviewAndReply(context3, client, config, request3, parentSignal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewSignal) {
+
+class MissingUserContextError extends Error {
+  constructor() {
+    super("Permission review had no user messages to judge against");
+    this.name = "MissingUserContextError";
+  }
+}
+async function decide(context3, client, config, request3, state, parentSignal, reviewSignal) {
   const input = await collectReviewInput(context3, request3, config.userMessageCount);
   if (parentSignal.aborted)
     return;
   const policyDecision = applyDeterministicPolicy(input);
   const approvalKey = reusableApprovalKey(config, request3, input);
-  const cachedDecision = !policyDecision && approvalKey && sessionApprovals.has(approvalKey) ? {
+  const cachedDecision = !policyDecision && approvalKey && state.sessionApprovals.has(approvalKey) ? {
     kind: "allow",
     reasonCode: "session_approval_reused",
     reason: "Reuses an approved narrow pattern from this session."
   } : undefined;
   const reviewKey = concurrentReviewKey(request3, input);
-  let shared = sharedReviews.get(reviewKey);
+  let shared = state.sharedReviews.get(reviewKey);
   if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context3, client, config, input, sharedReviewSignal);
-    sharedReviews.set(reviewKey, shared);
-    shared.finally(() => {
-      if (sharedReviews.get(reviewKey) === shared)
-        sharedReviews.delete(reviewKey);
+    if (state.requireUserMessages && input.context.userMessages.length === 0)
+      throw new MissingUserContextError;
+    const controller = new AbortController;
+    const review = {
+      decision: modelDecision(context3, client, config, input, request3.sessionID, AbortSignal.any([reviewSignal, controller.signal])),
+      controller,
+      waiters: 0
+    };
+    shared = review;
+    state.sharedReviews.set(reviewKey, review);
+    review.decision.finally(() => {
+      if (state.sharedReviews.get(reviewKey) === review)
+        state.sharedReviews.delete(reviewKey);
     }).catch(() => {
       return;
     });
   }
-  const decision = policyDecision ?? cachedDecision ?? await shared;
-  if (parentSignal.aborted)
+  const decision = policyDecision ?? cachedDecision ?? await waitForReview(state, reviewKey, shared, parentSignal);
+  if (!decision || parentSignal.aborted)
     return;
   if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
-    sessionApprovals.add(approvalKey);
+    state.sessionApprovals.add(approvalKey);
   }
+  return { decision, source: decisionSource(policyDecision, cachedDecision), input };
+}
+async function waitForReview(state, reviewKey, shared, parentSignal) {
+  if (!state.releaseUnwatchedReviews)
+    return shared.decision;
+  shared.waiters++;
+  let onAbort = () => {};
+  const stopped = new Promise((resolve2) => {
+    onAbort = () => resolve2(undefined);
+    if (parentSignal.aborted)
+      onAbort();
+    else
+      parentSignal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([shared.decision, stopped]);
+  } finally {
+    parentSignal.removeEventListener("abort", onAbort);
+    if (--shared.waiters === 0) {
+      if (state.sharedReviews.get(reviewKey) === shared)
+        state.sharedReviews.delete(reviewKey);
+      shared.controller.abort("no caller is waiting for this review");
+    }
+  }
+}
+function denialMessage(reason) {
+  return `Auto Permissions blocked this action: ${reason}`;
+}
+async function reviewAndReply(context3, client, config, request3, parentSignal, overrides, startedAt, state, sharedReviewSignal) {
+  const outcome = await decide(context3, client, config, request3, state, parentSignal, sharedReviewSignal);
+  if (!outcome)
+    return;
+  const { decision, source, input } = outcome;
   overrides.onDecision?.(request3, decision, config.shadow);
   if (config.shadow) {
-    writeDecision(config, request3, startedAt, decision, decisionSource(policyDecision, cachedDecision));
+    writeDecision(config, request3, startedAt, decision, source);
     return;
   }
   const pending = await isRequestPending(context3, request3);
@@ -23564,18 +23629,18 @@ async function reviewAndReply(context3, client, config, request3, parentSignal, 
       reply,
       protocol: request3.protocol
     });
-    writeDecision(config, request3, startedAt, decision, decisionSource(policyDecision, cachedDecision), result4, reply === "always" ? "session" : "once");
+    writeDecision(config, request3, startedAt, decision, source, result4, reply === "always" ? "session" : "once");
     return;
   }
   const result3 = await client.reply({
     sessionID: request3.sessionID,
     requestID: request3.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${decision.reason}`,
+    message: denialMessage(decision.reason),
     protocol: request3.protocol
   });
   context3.showToast?.({ title: "Blocked", message: decision.reason, variant: "warning", duration: 4000 });
-  writeDecision(config, request3, startedAt, decision, decisionSource(policyDecision, cachedDecision), result3);
+  writeDecision(config, request3, startedAt, decision, source, result3);
   if (result3 === "replied")
     context3.resumeAfterDenial?.(request3.sessionID, decision.reason, "denied");
 }
@@ -23590,7 +23655,7 @@ async function rejectAfterFailure(context3, client, config, request3, startedAt,
     sessionID: request3.sessionID,
     requestID: request3.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${reason}`,
+    message: denialMessage(reason),
     protocol: request3.protocol
   });
   context3.showToast?.({ title: "Blocked", message: reason, variant: "warning", duration: 4000 });
@@ -23619,7 +23684,13 @@ function reusableApprovalKey(config, request3, input) {
   return JSON.stringify([input.context.rootSessionID, request3.action, request3.always]);
 }
 function concurrentReviewKey(request3, input) {
-  return JSON.stringify([input.context.rootSessionID, request3.action, request3.resources, input.request.toolInput]);
+  return JSON.stringify([
+    input.context.rootSessionID,
+    request3.action,
+    request3.resources,
+    input.request.toolInput,
+    input.request.metadata
+  ]);
 }
 function decisionSource(policyDecision, cachedDecision) {
   return policyDecision ? "policy" : cachedDecision ? "session" : "model";
@@ -23691,7 +23762,7 @@ function cancelReview(config, inFlight, requestID) {
   });
   controller.abort("permission resolved");
 }
-async function modelDecision(context3, client, config, input, parentSignal) {
+async function modelDecision(context3, client, config, input, judgedSessionID, parentSignal) {
   const inheritedModel = input.context.model;
   const candidates = [];
   if (config.model) {
@@ -23721,7 +23792,7 @@ async function modelDecision(context3, client, config, input, parentSignal) {
       event: "model_attempt"
     });
     try {
-      const decision = await singleModelDecision(client, config, input, parentSignal, model);
+      const decision = await singleModelDecision(client, config, input, judgedSessionID, parentSignal, model);
       writeDiagnostic(config.diagnosticsPath, {
         ...diagnostic,
         timestamp: new Date().toISOString(),
@@ -23744,7 +23815,7 @@ async function modelDecision(context3, client, config, input, parentSignal) {
   }
   throw lastError;
 }
-async function singleModelDecision(client, config, input, parentSignal, model) {
+async function singleModelDecision(client, config, input, judgedSessionID, parentSignal, model) {
   const timeout3 = new AbortController;
   const timer = setTimeout(() => timeout3.abort("review timed out"), config.timeoutMs);
   const abort = () => timeout3.abort(parentSignal.reason);
@@ -23762,7 +23833,7 @@ async function singleModelDecision(client, config, input, parentSignal, model) {
       structured = await Promise.race([aborted, client.generate({
         prompt: buildReviewPrompt(input),
         model,
-        parentSessionID: input.context.rootSessionID,
+        parentSessionID: judgedSessionID,
         ...input.context.directory ? { location: { directory: input.context.directory } } : {},
         signal: timeout3.signal
       })]);
@@ -23783,6 +23854,278 @@ async function singleModelDecision(client, config, input, parentSignal, model) {
 }
 function sameModelId(left, right) {
   return left.providerID === right.providerID && left.id === right.id;
+}
+
+// src/server-runtime.ts
+var MAX_SESSION_CACHE = 256;
+var MAX_MESSAGE_CACHE = 32;
+var MAX_PERMISSION_CACHE = 64;
+var MAX_MESSAGES_PER_SESSION = 200;
+function createServerRuntime(context3, options2 = {}) {
+  const failClosed = options2.failClosed === true;
+  const listeners = new Map;
+  const sessions = new Map;
+  const messages = new Map;
+  const permissions = new Map;
+  const getSession = async (sessionID) => {
+    const cached3 = sessions.get(sessionID);
+    if (cached3)
+      return cached3;
+    const fetched = unwrapServerData(await context3.session.get({ sessionID }));
+    if (!isRecord4(fetched) || typeof fetched.id !== "string")
+      return;
+    const info = {
+      id: fetched.id,
+      ...typeof fetched.parentID === "string" ? { parentID: fetched.parentID } : {},
+      ...isRecord4(fetched.location) ? { location: fetched.location } : {}
+    };
+    setBounded(sessions, sessionID, info, MAX_SESSION_CACHE);
+    return info;
+  };
+  const root = async (sessionID) => {
+    const seen = new Set;
+    let current = sessionID;
+    while (!seen.has(current)) {
+      seen.add(current);
+      const info = failClosed ? await getSession(current) : await getSession(current).catch(() => {
+        return;
+      });
+      if (!info)
+        return sessionID;
+      if (!info.parentID)
+        return current;
+      current = info.parentID;
+    }
+    return sessionID;
+  };
+  const runtimeContext = {
+    options: context3.options,
+    client: context3,
+    location: context3.location,
+    data: {
+      on(type, handler) {
+        const set2 = listeners.get(type) ?? new Set;
+        set2.add(handler);
+        listeners.set(type, set2);
+        return () => set2.delete(handler);
+      },
+      session: {
+        root,
+        get: (sessionID) => sessions.get(sessionID),
+        message: {
+          list: (sessionID) => messages.get(sessionID) ?? [],
+          get: (sessionID, messageID) => (messages.get(sessionID) ?? []).find((message) => isRecord4(message) && messageIdOf(message, failClosed) === messageID),
+          sync: async (sessionID) => {
+            const list = unwrapServerData(await context3.session.context({ sessionID }));
+            const bounded2 = Array.isArray(list) ? failClosed ? [...list] : list.slice(-MAX_MESSAGES_PER_SESSION) : [];
+            setBounded(messages, sessionID, bounded2, MAX_MESSAGE_CACHE);
+          }
+        },
+        permission: {
+          list: (sessionID) => permissions.get(sessionID),
+          sync: async (sessionID) => {
+            const list = unwrapServerData(await context3.permission.list({ sessionID }));
+            setBounded(permissions, sessionID, Array.isArray(list) ? list : [], MAX_PERMISSION_CACHE);
+          }
+        }
+      },
+      location: { default: () => context3.location ?? {} }
+    }
+  };
+  return {
+    context: runtimeContext,
+    listeners,
+    getSession,
+    clear() {
+      listeners.clear();
+      sessions.clear();
+      messages.clear();
+      permissions.clear();
+    }
+  };
+}
+function setBounded(map10, key, value3, limit) {
+  if (!map10.has(key) && map10.size >= limit) {
+    const oldest = map10.keys().next().value;
+    if (oldest !== undefined)
+      map10.delete(oldest);
+  }
+  map10.set(key, value3);
+}
+function unwrapServerData(result3) {
+  let value3 = result3;
+  for (let depth = 0;depth < 3 && isRecord4(value3) && "data" in value3; depth++) {
+    value3 = value3.data;
+  }
+  return value3;
+}
+function messageIdOf(message, includeInfo) {
+  return includeInfo && isRecord4(message.info) ? message.info.id : message.id;
+}
+function isRecord4(value3) {
+  return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
+}
+
+// src/evaluate.ts
+function hasSource(event) {
+  return event.source !== undefined;
+}
+var CALL_VERDICT_TTL_MS = 60000;
+var MAX_HOOK_TIMEOUT_MS = 30000;
+async function installEvaluateHook(host, overrides = {}) {
+  const config = parseConfig(host.options);
+  if (!config.serverReview || config.shadow)
+    return async () => {};
+  const client = overrides.client ?? new ServerReviewerClient(host, config);
+  const runtime = createServerRuntime(host, { failClosed: true });
+  const state = {
+    sharedReviews: new Map,
+    sessionApprovals: new Set,
+    releaseUnwatchedReviews: true,
+    requireUserMessages: true
+  };
+  const disposed = new AbortController;
+  const verdicts = new Map;
+  const expiries = new Set;
+  const remember = (key, verdict) => {
+    verdicts.set(key, verdict);
+    const expiry = setTimeout(() => {
+      expiries.delete(expiry);
+      if (verdicts.get(key) === verdict)
+        verdicts.delete(key);
+    }, CALL_VERDICT_TTL_MS);
+    expiry.unref?.();
+    expiries.add(expiry);
+  };
+  const registration = await host.permission.hook("evaluate", async (event) => {
+    try {
+      if (event.effect !== "ask" || !hasSource(event) || event.agent === REVIEWER_AGENT_ID)
+        return;
+      const key = callKey(event);
+      const reused = verdicts.get(key);
+      const verdict = reused ?? await review(runtime.context, client, config, state, event, disposed.signal);
+      if (!reused && verdict.effect !== "ask")
+        remember(key, verdict);
+      apply2(event, verdict);
+    } catch (error) {
+      apply2(event, escalation(error));
+    }
+  });
+  return async () => {
+    disposed.abort("plugin disposed");
+    for (const expiry of expiries)
+      clearTimeout(expiry);
+    expiries.clear();
+    verdicts.clear();
+    state.sharedReviews.clear();
+    state.sessionApprovals.clear();
+    runtime.clear();
+    await registration.dispose();
+  };
+}
+async function review(context3, client, config, state, event, disposedSignal) {
+  const request3 = {
+    id: event.source.id,
+    sessionID: event.sessionID,
+    action: event.action,
+    resources: [...event.resources],
+    always: [],
+    source: { type: "tool", messageID: event.source.messageID, callID: event.source.id },
+    ...event.metadata ? { metadata: { ...event.metadata } } : {},
+    protocol: "v2"
+  };
+  const logged = { ...request3, protocol: "evaluate" };
+  const startedAt = performance.now();
+  writeReceived(config, logged);
+  const deadline = new AbortController;
+  const timer = setTimeout(() => deadline.abort("review timed out"), Math.min(config.timeoutMs, MAX_HOOK_TIMEOUT_MS));
+  const signal = AbortSignal.any([disposedSignal, deadline.signal]);
+  const stop = abortRejection(signal);
+  try {
+    const outcome = await Promise.race([
+      decide(context3, client, config, request3, state, signal, disposedSignal),
+      stop.promise
+    ]);
+    if (!outcome)
+      throw stopError(deadline.signal);
+    writeDecision(config, logged, startedAt, outcome.decision, outcome.source);
+    return outcome.decision.kind === "deny" ? { effect: "deny", message: denialMessage(outcome.decision.reason) } : { effect: "allow" };
+  } catch (error) {
+    const failure = signal.aborted ? stopError(deadline.signal) : error;
+    writeFailure(config, logged, startedAt, failure);
+    return escalation(failure);
+  } finally {
+    clearTimeout(timer);
+    stop.cleanup();
+  }
+}
+function apply2(event, verdict) {
+  event.effect = verdict.effect;
+  if (verdict.message)
+    event.message = verdict.message;
+}
+function escalation(error) {
+  const cause = error instanceof MissingUserContextError ? "the session context held no user messages to review it against" : failureCategory(error) === "timeout" ? "the review timed out" : "the review failed";
+  return {
+    effect: "ask",
+    message: `${REVIEW_ESCALATED_PREFIX}: ${cause}, so this request needs your approval.`
+  };
+}
+function callKey(event) {
+  const metadata = createHash("sha256").update(stableJson(event.metadata ?? null)).digest("hex");
+  return JSON.stringify([event.sessionID, event.source.messageID, event.source.id, event.action, event.resources, metadata]);
+}
+function stableJson(value3) {
+  return JSON.stringify(value3, (_key, item) => isRecord5(item) ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left < right ? -1 : 1)) : item);
+}
+function stopError(deadline) {
+  return deadline.aborted ? new Error("Permission review timed out") : new Error("Permission review cancelled");
+}
+function abortRejection(signal) {
+  let onAbort = () => {};
+  const promise3 = new Promise((_resolve, reject) => {
+    onAbort = () => reject(new Error("Permission review stopped"));
+    if (signal.aborted)
+      onAbort();
+    else
+      signal.addEventListener("abort", onAbort, { once: true });
+  });
+  promise3.catch(() => {
+    return;
+  });
+  return { promise: promise3, cleanup: () => signal.removeEventListener("abort", onAbort) };
+}
+
+class ServerReviewerClient {
+  host;
+  config;
+  endpoint;
+  constructor(host, config) {
+    this.host = host;
+    this.config = config;
+    this.endpoint = new OpenCodeClientAdapter(undefined, {
+      diagnosticsPath: config.diagnosticsPath,
+      endpoint: config.structuredEndpoint
+    });
+  }
+  async generate(input) {
+    if (this.config.structuredEndpoint?.providerID === input.model.providerID)
+      return this.endpoint.generate(input);
+    const result3 = await this.host.generate.text({ model: input.model, prompt: `${REVIEWER_SYSTEM_PROMPT}
+
+${input.prompt}
+
+${JSON_ONLY_INSTRUCTION}` }, { signal: input.signal });
+    if (!isRecord5(result3) || typeof result3.text !== "string")
+      throw new Error("OpenCode reviewer returned no text output");
+    return parseReviewerJson(result3.text);
+  }
+  async reply() {
+    throw new Error("The evaluate hook settles requests in place and never replies");
+  }
+}
+function isRecord5(value3) {
+  return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
 }
 
 // src/stable.ts
@@ -23826,7 +24169,7 @@ function createStableRuntime(injectedClient, options2, directory2) {
       let session = sessions.get(current);
       if (!session) {
         const result3 = unwrap(await client.session.get({ path: { id: current }, query: { directory: directory2 } }));
-        if (!isRecord4(result3) || typeof result3.id !== "string")
+        if (!isRecord6(result3) || typeof result3.id !== "string")
           return sessionID;
         session = {
           id: result3.id,
@@ -23909,7 +24252,7 @@ function createStableRuntime(injectedClient, options2, directory2) {
       if (typeof client.global?.health !== "function")
         return;
       const result3 = unwrap(await client.global.health());
-      return isRecord4(result3) && typeof result3.version === "string" ? result3.version : undefined;
+      return isRecord6(result3) && typeof result3.version === "string" ? result3.version : undefined;
     },
     emit(event) {
       const asked = normalizeAskedEvent(event);
@@ -23938,13 +24281,13 @@ function createStableRuntime(injectedClient, options2, directory2) {
 function latestUserRouting(messages) {
   for (let index2 = messages.length - 1;index2 >= 0; index2--) {
     const message = messages[index2];
-    if (!isRecord4(message))
+    if (!isRecord6(message))
       continue;
-    const info = isRecord4(message.info) ? message.info : message;
+    const info = isRecord6(message.info) ? message.info : message;
     if (info.role !== "user")
       continue;
     const agent = typeof info.agent === "string" ? info.agent : undefined;
-    const modelValue = isRecord4(info.model) ? info.model : undefined;
+    const modelValue = isRecord6(info.model) ? info.model : undefined;
     const providerID = modelValue?.providerID;
     const modelID = modelValue?.modelID ?? modelValue?.id;
     const model = typeof providerID === "string" && typeof modelID === "string" ? { providerID, modelID } : undefined;
@@ -23964,7 +24307,7 @@ async function waitForIdle(client, sessionID, directory2, signal) {
   }
   for (let attempt = 0;attempt < 50 && !signal.aborted; attempt++) {
     const statuses = unwrap(await client.session.status({ query: { directory: directory2 } }));
-    if (!isRecord4(statuses) || !isRecord4(statuses[sessionID]) || statuses[sessionID].type === "idle")
+    if (!isRecord6(statuses) || !isRecord6(statuses[sessionID]) || statuses[sessionID].type === "idle")
       return true;
     await delay3(100, signal);
   }
@@ -23990,7 +24333,7 @@ function protocolForVersion(version) {
   return major >= 2 ? "v2" : "stable";
 }
 function compatibleClient(value3) {
-  if (isRecord4(value3))
+  if (isRecord6(value3))
     return value3;
   throw new Error("OpenCode compatible authenticated client is unavailable");
 }
@@ -23998,27 +24341,23 @@ function unwrap(result3) {
   if (result3?.error)
     throw result3.error;
   let value3 = result3?.data ?? result3;
-  if (isRecord4(value3) && "data" in value3)
+  if (isRecord6(value3) && "data" in value3)
     value3 = value3.data;
   return value3;
 }
 function messageIDOf(value3) {
-  if (!isRecord4(value3))
+  if (!isRecord6(value3))
     return;
   if (typeof value3.id === "string")
     return value3.id;
-  return isRecord4(value3.info) && typeof value3.info.id === "string" ? value3.info.id : undefined;
+  return isRecord6(value3.info) && typeof value3.info.id === "string" ? value3.info.id : undefined;
 }
-function isRecord4(value3) {
+function isRecord6(value3) {
   return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
 }
 
 // src/server.ts
 var REVIEWER_DESCRIPTION = "Hidden, no-tool permission reviewer used by OpenCode Auto Permissions.";
-var MAX_SESSION_CACHE = 256;
-var MAX_MESSAGE_CACHE = 32;
-var MAX_PERMISSION_CACHE = 64;
-var MAX_MESSAGES_PER_SESSION = 200;
 var v2Plugin = exports_plugin.define({
   id: SERVER_PLUGIN_ID,
   async setup(context3) {
@@ -24039,22 +24378,24 @@ var v2Plugin = exports_plugin.define({
       return;
     if (context3.location?.directory === REVIEWER_DIRECTORY)
       return;
-    if (!supportsServerV2Review(context3))
-      return;
-    const cleanup = installServerV2Reviewer(context3, config.diagnosticsPath);
-    if (!cleanup)
-      return;
+    const stopServerReviewer = supportsServerV2Review(context3) ? installServerV2Reviewer(context3, config.diagnosticsPath) : undefined;
     try {
-      await context3.agent.transform((draft) => {
-        draft.update(REVIEWER_AGENT_ID, (agent) => {
-          agent.description = `${REVIEWER_DESCRIPTION} ${SERVER_REVIEW_MARKER}`;
+      if (stopServerReviewer) {
+        await context3.agent.transform((draft) => {
+          draft.update(REVIEWER_AGENT_ID, (agent) => {
+            agent.description = `${REVIEWER_DESCRIPTION} ${SERVER_REVIEW_MARKER}`;
+          });
         });
-      });
+      }
+      const stopEvaluateHook = await installEvaluateHook(context3);
+      return async () => {
+        stopServerReviewer?.();
+        await stopEvaluateHook();
+      };
     } catch (error) {
-      cleanup();
+      stopServerReviewer?.();
       throw error;
     }
-    return cleanup;
   }
 });
 function supportsServerV2Review(context3) {
@@ -24062,75 +24403,11 @@ function supportsServerV2Review(context3) {
   return typeof value3?.event?.subscribe === "function" && typeof value3?.permission?.list === "function" && typeof value3?.permission?.reply === "function" && typeof value3?.session?.get === "function" && typeof value3?.session?.context === "function" && typeof value3?.session?.create === "function" && typeof value3?.session?.generate === "function" && typeof value3?.session?.remove === "function";
 }
 function installServerV2Reviewer(context3, diagnosticsPath) {
-  const listeners = new Map;
-  const sessions = new Map;
-  const messages = new Map;
-  const permissions = new Map;
+  const runtime = createServerRuntime(context3);
+  const { listeners, getSession } = runtime;
   const abortController = new AbortController;
-  const getSession = async (sessionID) => {
-    const cached3 = sessions.get(sessionID);
-    if (cached3)
-      return cached3;
-    const fetched = unwrapServerData(await context3.session.get({ sessionID }));
-    if (!isRecord5(fetched) || typeof fetched.id !== "string")
-      return;
-    const info = {
-      id: fetched.id,
-      ...typeof fetched.parentID === "string" ? { parentID: fetched.parentID } : {},
-      ...isRecord5(fetched.location) ? { location: fetched.location } : {}
-    };
-    setBounded(sessions, sessionID, info, MAX_SESSION_CACHE);
-    return info;
-  };
-  const root = async (sessionID) => {
-    const seen = new Set;
-    let current = sessionID;
-    while (!seen.has(current)) {
-      seen.add(current);
-      const info = await getSession(current).catch(() => {
-        return;
-      });
-      if (!info)
-        return sessionID;
-      if (!info.parentID)
-        return current;
-      current = info.parentID;
-    }
-    return sessionID;
-  };
   const runtimeContext = {
-    options: context3.options,
-    client: context3,
-    location: context3.location,
-    data: {
-      on(type, handler) {
-        const set2 = listeners.get(type) ?? new Set;
-        set2.add(handler);
-        listeners.set(type, set2);
-        return () => set2.delete(handler);
-      },
-      session: {
-        root,
-        get: (sessionID) => sessions.get(sessionID),
-        message: {
-          list: (sessionID) => messages.get(sessionID) ?? [],
-          get: (sessionID, messageID) => (messages.get(sessionID) ?? []).find((message) => isRecord5(message) && message.id === messageID),
-          sync: async (sessionID) => {
-            const list = unwrapServerData(await context3.session.context({ sessionID }));
-            const bounded2 = Array.isArray(list) ? list.slice(-MAX_MESSAGES_PER_SESSION) : [];
-            setBounded(messages, sessionID, bounded2, MAX_MESSAGE_CACHE);
-          }
-        },
-        permission: {
-          list: (sessionID) => permissions.get(sessionID),
-          sync: async (sessionID) => {
-            const list = unwrapServerData(await context3.permission.list({ sessionID }));
-            setBounded(permissions, sessionID, Array.isArray(list) ? list : [], MAX_PERMISSION_CACHE);
-          }
-        }
-      },
-      location: { default: () => context3.location ?? {} }
-    },
+    ...runtime.context,
     resumeAfterDenial(sessionID, reason, kind) {
       if (typeof context3.session?.prompt !== "function")
         return;
@@ -24187,11 +24464,11 @@ function installServerV2Reviewer(context3, diagnosticsPath) {
       for await (const event of stream) {
         if (abortController.signal.aborted)
           break;
-        if (!isRecord5(event) || typeof event.type !== "string")
+        if (!isRecord7(event) || typeof event.type !== "string")
           continue;
         if (event.type === "permission.asked") {
-          const eventLocation = isRecord5(event.location) ? event.location : undefined;
-          const sessionID = isRecord5(event.data) && typeof event.data.sessionID === "string" ? event.data.sessionID : undefined;
+          const eventLocation = isRecord7(event.location) ? event.location : undefined;
+          const sessionID = isRecord7(event.data) && typeof event.data.sessionID === "string" ? event.data.sessionID : undefined;
           const resolvedLocation = eventLocation ?? (sessionID ? (await getSession(sessionID).catch(() => {
             return;
           }))?.location : undefined);
@@ -24206,28 +24483,10 @@ function installServerV2Reviewer(context3, diagnosticsPath) {
   return () => {
     abortController.abort("plugin disposed");
     stopReviewer();
-    listeners.clear();
-    sessions.clear();
-    messages.clear();
-    permissions.clear();
+    runtime.clear();
   };
 }
-function setBounded(map10, key, value3, limit) {
-  if (!map10.has(key) && map10.size >= limit) {
-    const oldest = map10.keys().next().value;
-    if (oldest !== undefined)
-      map10.delete(oldest);
-  }
-  map10.set(key, value3);
-}
-function unwrapServerData(result3) {
-  let value3 = result3;
-  for (let depth = 0;depth < 3 && isRecord5(value3) && "data" in value3; depth++) {
-    value3 = value3.data;
-  }
-  return value3;
-}
-function isRecord5(value3) {
+function isRecord7(value3) {
   return typeof value3 === "object" && value3 !== null && !Array.isArray(value3);
 }
 var legacyPlugin = async (input, options2 = {}) => {
