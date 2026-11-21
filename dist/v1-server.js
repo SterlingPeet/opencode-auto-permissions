@@ -22806,6 +22806,7 @@ var REVIEWER_PERMISSIONS = [
 ];
 var REVIEWER_DIRECTORY = join3(tmpdir(), "opencode-auto-permissions", "reviewer");
 var REVIEWER_SESSION_TITLE = "Auto Permissions review";
+var ROUTER_SESSION_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 function parseReviewerJson(text) {
   try {
     return JSON.parse(text);
@@ -22989,7 +22990,8 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        ...apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+        ...apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        ...ROUTER_SESSION_ID.test(input.parentSessionID) ? { "x-parent-session-id": input.parentSessionID } : {}
       },
       body: JSON.stringify({
         model: input.model.id,
@@ -23500,7 +23502,7 @@ async function reviewAndReply(context3, client, config, request3, parentSignal, 
   const reviewKey = concurrentReviewKey(request3, input);
   let shared = sharedReviews.get(reviewKey);
   if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context3, client, config, input, sharedReviewSignal);
+    shared = modelDecision(context3, client, config, input, request3.sessionID, sharedReviewSignal);
     sharedReviews.set(reviewKey, shared);
     shared.finally(() => {
       if (sharedReviews.get(reviewKey) === shared)
@@ -23658,7 +23660,7 @@ function cancelReview(config, inFlight, requestID) {
   });
   controller.abort("permission resolved");
 }
-async function modelDecision(context3, client, config, input, parentSignal) {
+async function modelDecision(context3, client, config, input, judgedSessionID, parentSignal) {
   const inheritedModel = input.context.model;
   const candidates = [];
   if (config.model) {
@@ -23688,7 +23690,7 @@ async function modelDecision(context3, client, config, input, parentSignal) {
       event: "model_attempt"
     });
     try {
-      const decision = await singleModelDecision(client, config, input, parentSignal, model);
+      const decision = await singleModelDecision(client, config, input, judgedSessionID, parentSignal, model);
       writeDiagnostic(config.diagnosticsPath, {
         ...diagnostic,
         timestamp: new Date().toISOString(),
@@ -23711,7 +23713,7 @@ async function modelDecision(context3, client, config, input, parentSignal) {
   }
   throw lastError;
 }
-async function singleModelDecision(client, config, input, parentSignal, model) {
+async function singleModelDecision(client, config, input, judgedSessionID, parentSignal, model) {
   const timeout3 = new AbortController;
   const timer = setTimeout(() => timeout3.abort("review timed out"), config.timeoutMs);
   const abort = () => timeout3.abort(parentSignal.reason);
@@ -23729,7 +23731,7 @@ async function singleModelDecision(client, config, input, parentSignal, model) {
       structured = await Promise.race([aborted, client.generate({
         prompt: buildReviewPrompt(input),
         model,
-        parentSessionID: input.context.rootSessionID,
+        parentSessionID: judgedSessionID,
         ...input.context.directory ? { location: { directory: input.context.directory } } : {},
         signal: timeout3.signal
       })]);

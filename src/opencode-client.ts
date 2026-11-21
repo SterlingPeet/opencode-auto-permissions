@@ -12,6 +12,9 @@ const REVIEWER_PERMISSIONS = [
 ] as const
 const REVIEWER_DIRECTORY = join(tmpdir(), "opencode-auto-permissions", "reviewer")
 const REVIEWER_SESSION_TITLE = "Auto Permissions review"
+// router-next keeps an x-parent-session-id only if it matches this pattern, so
+// an id outside it is omitted rather than truncated into a different id.
+const ROUTER_SESSION_ID = /^[A-Za-z0-9._:-]{1,64}$/
 
 // Local models wrap the decision in fences, prose, or a stray closing tag, so
 // accept the text from the first "{" to the last "}". A permission gate must
@@ -214,7 +217,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
   // already bounds the runtime.
   private async generateViaEndpoint(
     endpoint: StructuredEndpoint,
-    input: { prompt: string; model: ReviewModel; signal: AbortSignal },
+    input: { prompt: string; model: ReviewModel; parentSessionID: string; signal: AbortSignal },
   ): Promise<unknown> {
     const apiKey = endpoint.apiKey ?? (endpoint.apiKeyEnv ? process.env[endpoint.apiKeyEnv] : undefined)
     const response = await (this.options.fetchImpl ?? fetch)(`${endpoint.baseURL.replace(/\/+$/, "")}/chat/completions`, {
@@ -222,6 +225,9 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       headers: {
         "Content-Type": "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        // Attributes the gate call to the session whose tool call it judges. No
+        // x-session-affinity of its own, because a review is a one-shot judgement.
+        ...(ROUTER_SESSION_ID.test(input.parentSessionID) ? { "x-parent-session-id": input.parentSessionID } : {}),
       },
       body: JSON.stringify({
         model: input.model.id,
